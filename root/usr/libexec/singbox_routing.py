@@ -160,9 +160,9 @@ def compile_profile(data, base, nodes, settings, store, paths=None, force=False)
     if profile['capture_mode'] == 'automatic':
         for inbound in config['inbounds']:
             if inbound.get('type') == 'tun':
-                inbound.update(auto_route=True, auto_redirect=True, strict_route=False,
+                inbound.update(auto_route=True, auto_redirect=True, strict_route=False, stack='gvisor',
                                dns_mode='disabled' if settings.get('dns_mode') == 'https_dns_proxy' else 'hijack',
-                               route_exclude_address=['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '224.0.0.0/4'])
+                               route_exclude_address=['0.0.0.0/8', '240.0.0.0/4', '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '224.0.0.0/4'])
         # auto_redirect manages its own marks; explicit routing_mark conflicts with it.
         for item in config['outbounds']:
             item.pop('routing_mark', None)

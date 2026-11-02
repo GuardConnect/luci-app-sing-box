@@ -1,3 +1,4 @@
+import os
 import base64
 import copy
 import importlib.machinery
@@ -31,6 +32,10 @@ class BackendTests(unittest.TestCase):
         isolated = patch.object(b, 'STORE', Path(store.name))
         isolated.start()
         self.addCleanup(isolated.stop)
+        if os.environ.get('SINGBOX_TEST_BINARY'):
+            core = patch.object(b, 'core_binary', return_value=os.environ['SINGBOX_TEST_BINARY'])
+            core.start()
+            self.addCleanup(core.stop)
 
     def test_primary_dns_ignores_unused_external_settings(self):
         cfg = b.config(dict(S, dns_mode='https_dns_proxy', dns='',
@@ -176,6 +181,9 @@ class BackendTests(unittest.TestCase):
         cfg,_=b.routing.compile_profile(profile,base,[],S,Path('/tmp'))
         self.assertTrue(cfg['inbounds'][0]['auto_route']);self.assertTrue(cfg['inbounds'][0]['auto_redirect'])
         self.assertFalse(cfg['inbounds'][0]['strict_route'])
+        self.assertEqual(cfg['inbounds'][0]['stack'],'gvisor')
+        self.assertIn('240.0.0.0/4',cfg['inbounds'][0]['route_exclude_address'])
+        self.assertIn('0.0.0.0/8',cfg['inbounds'][0]['route_exclude_address'])
         self.assertEqual(cfg['inbounds'][0]['dns_mode'],'hijack')
         primary=dict(S,dns_mode='https_dns_proxy')
         primary_cfg,_=b.routing.compile_profile(profile,b.config(primary,None,with_routing=False),[],primary,Path('/tmp'))
@@ -185,7 +193,7 @@ class BackendTests(unittest.TestCase):
         self.assertIn('192.168.0.0/16',cfg['inbounds'][0]['route_exclude_address'])
         with tempfile.NamedTemporaryFile(mode='w',suffix='.json') as f:
             json.dump(cfg,f);f.flush()
-            checked=subprocess.run(['/usr/bin/sing-box','check','-c',f.name],capture_output=True,text=True)
+            checked=subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'),'check','-c',f.name],capture_output=True,text=True)
             self.assertEqual(checked.returncode,0,checked.stderr)
         with self.assertRaises(ValueError):b.routing.normalize(dict(profile,enabled=False))
 
@@ -237,13 +245,13 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(required,[])
         with tempfile.NamedTemporaryFile(mode='w',suffix='.json') as f:
             json.dump(cfg,f);f.flush()
-            checked=subprocess.run(['/usr/bin/sing-box','check','-c',f.name],capture_output=True,text=True)
+            checked=subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'),'check','-c',f.name],capture_output=True,text=True)
             self.assertEqual(checked.returncode,0,checked.stderr)
         profile['rules'][0]['conditions']['domain_regex']=['(?=unsupported)']
         cfg,_=b.routing.compile_profile(profile,base,[first,other],S,Path('/tmp/routing-test'))
         with tempfile.NamedTemporaryFile(mode='w',suffix='.json') as f:
             json.dump(cfg,f);f.flush()
-            checked=subprocess.run(['/usr/bin/sing-box','check','-c',f.name],capture_output=True,text=True)
+            checked=subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'),'check','-c',f.name],capture_output=True,text=True)
             self.assertNotEqual(checked.returncode,0,'RE2 must reject lookahead')
 
     def test_geosite_uses_remote_rule_set_and_current_http_client(self):
@@ -259,7 +267,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(cfg['route']['rules'][-1]['action'],'reject')
         with tempfile.NamedTemporaryFile(mode='w',suffix='.json') as f:
             json.dump(cfg,f);f.flush()
-            checked=subprocess.run(['/usr/bin/sing-box','check','-c',f.name],capture_output=True,text=True)
+            checked=subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'),'check','-c',f.name],capture_output=True,text=True)
             self.assertEqual(checked.returncode,0,checked.stderr)
 
     def test_routing_validation_and_disabled_profile(self):
@@ -301,7 +309,7 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(cfg['log']['level'], 'info' if level == 'disabled' else level)
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
                     json.dump(cfg, f); f.flush()
-                    result = subprocess.run(['/usr/bin/sing-box','check','-c',f.name], capture_output=True, text=True)
+                    result = subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'),'check','-c',f.name], capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
         with self.assertRaises(ValueError):
             b.config(dict(S, log_level='invalid'), b.parse_vless(BASE))
@@ -574,7 +582,7 @@ class BackendTests(unittest.TestCase):
         self.assertNotIn('remote', json.dumps(cfg))
         with tempfile.NamedTemporaryFile(mode='w') as f:
             json.dump(cfg, f); f.flush()
-            r = subprocess.run(['/usr/bin/sing-box', 'check', '-c', f.name], capture_output=True, text=True)
+            r = subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'), 'check', '-c', f.name], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_unsafe_interface_and_dns(self):
@@ -599,7 +607,7 @@ class BackendTests(unittest.TestCase):
                     self.assertFalse(cfg['inbounds'][0]['auto_redirect'])
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
                         json.dump(cfg, f); f.flush()
-                        r = subprocess.run(['/usr/bin/sing-box', 'check', '-c', f.name], capture_output=True, text=True)
+                        r = subprocess.run([os.environ.get('SINGBOX_TEST_BINARY', '/usr/bin/sing-box'), 'check', '-c', f.name], capture_output=True, text=True)
                         self.assertEqual(r.returncode, 0, r.stderr)
 
 
