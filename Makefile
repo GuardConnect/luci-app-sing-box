@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-sing-box
-PKG_VERSION:=0.1.0
-PKG_RELEASE:=8
+PKG_VERSION:=0.1.1
+PKG_RELEASE:=1
 PKG_LICENSE:=MIT CC-BY-4.0
 
 include $(INCLUDE_DIR)/package.mk

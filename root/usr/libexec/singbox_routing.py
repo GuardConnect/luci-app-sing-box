@@ -61,7 +61,7 @@ def ports(values):
 def normalize(data):
     if not isinstance(data, dict) or set(data) - (set(defaults()) | {'name'}):
         raise ValueError('Invalid routing profile')
-    if data.get('version', 1) != 1:
+    if type(data.get('version', 1)) is not int or data.get('version', 1) != 1:
         raise ValueError('Invalid routing profile')
     result = defaults()
     result.update(enabled=boolean(data.get('enabled'), True), sniff=boolean(data.get('sniff'), True),
@@ -135,7 +135,8 @@ def normalize(data):
         for key in BOOL_FIELDS:
             if boolean(conditions.get(key)):
                 rule['conditions'][key] = True
-        if conditions.get('ip_version') not in (None, '', 0, 4, 6):
+        ip_version = conditions.get('ip_version')
+        if ip_version not in (None, '') and (type(ip_version) is not int or ip_version not in (0, 4, 6)):
             raise ValueError('IP version must be 4 or 6')
         if conditions.get('ip_version'):
             rule['conditions']['ip_version'] = conditions['ip_version']
@@ -225,7 +226,21 @@ def compile_profile(data, base, nodes, settings, store, paths=None, force=False)
                     used.update(value)
         if rule['match_all']:
             matches = [dict(inbound=['tun-in'])]
-        inner = dict(type='logical', mode=rule['mode'], rules=matches, invert=rule['invert'])
+        if rule['mode'] == 'and':
+            # Throne emits one native default rule. Sing-box groups destination
+            # matchers (domain/suffix/regex/IP), source IP matchers, and ports.
+            # Splitting these into logical AND children changes their meaning.
+            inner = {}
+            for condition in matches:
+                for key, value in condition.items():
+                    if key in inner and isinstance(value, list):
+                        inner[key] = list(dict.fromkeys(inner[key] + value))
+                    else:
+                        inner[key] = value
+            inner['invert'] = rule['invert']
+        else:
+            # Explicit UI OR remains an extension: any populated field matches.
+            inner = dict(type='logical', mode='or', rules=matches, invert=rule['invert'])
         outer = dict(type='logical', mode='and', rules=[dict(inbound=['tun-in']), inner])
         outer.update(action(rule['outbound']))
         result.append(outer)
