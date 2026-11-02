@@ -1,0 +1,7 @@
+#!/bin/sh
+# PBR needs a new table after the TUN becomes available, including after reboot.
+[ "$ACTION" = ifup ] || exit 0
+[ "$INTERFACE" = "$(uci -q get singbox_gui.main.interface)" ] || exit 0
+[ -x /etc/init.d/pbr ] || exit 0
+[ "$(uci -q get pbr.config.enabled)" = 1 ] || exit 0
+/etc/init.d/pbr reload >/dev/null 2>&1 &

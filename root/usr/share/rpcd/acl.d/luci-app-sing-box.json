@@ -1,0 +1,59 @@
+{
+  "luci-app-sing-box": {
+    "description": "Manage sing-box subscriptions and its PBR interface",
+    "read": {
+      "ubus": {
+        "luci.singbox": [
+          "status",
+          "nodes",
+          "logs",
+          "subscriptions",
+          "interfaces",
+          "routing_get",
+          "routing_poll"
+        ],
+        "luci.singbox.core": [
+          "status",
+          "poll"
+        ]
+      },
+      "uci": [
+        "singbox_gui"
+      ]
+    },
+    "write": {
+      "ubus": {
+        "luci.singbox": [
+          "routing_start",
+          "set_language",
+          "subscription_save",
+          "subscription_refresh",
+          "subscription_reregister",
+          "subscription_delete",
+          "import",
+          "apply",
+          "stop",
+          "restart",
+          "hwid",
+          "latency",
+          "probe_start",
+          "probe_poll",
+          "config_get",
+          "config_save",
+          "config_auto",
+          "create_interface",
+          "create_firewall",
+          "probe_cancel"
+        ],
+        "luci.singbox.core": [
+          "check",
+          "install",
+          "restore"
+        ]
+      },
+      "uci": [
+        "singbox_gui"
+      ]
+    }
+  }
+}

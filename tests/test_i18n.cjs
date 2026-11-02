@@ -1,0 +1,17 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const code=fs.readFileSync('luci-app-sing-box/htdocs/luci-static/resources/singbox-i18n.js','utf8');
+const i=vm.runInNewContext('(function(){'+code+'})()',{baseclass:{extend:x=>x}});
+i.setLanguage('en');
+for(const [ru,en] of Object.entries(i.catalogue)) assert.equal(i.tr(ru),en,'English: '+ru);
+assert.equal(i.tr('Подписка обновлена.'),'Subscription updated.');
+assert.equal(i.tr('Загрузка и проверка SHA-256 версии 1.14.4'),'Downloading and verifying SHA-256 for version 1.14.4');
+assert.equal(i.locale(),'en-US');
+i.setLanguage('ru');
+assert.equal(i.tr('Subscription download failed (curl code 6)'),'Не удалось загрузить подписку (код curl 6)');
+assert.equal(i.tr('Line 3: Invalid VLESS URI'),'Строка 3: Некорректная VLESS-ссылка');
+assert.equal(i.tr('Applied. PBR is reloading in the background. Select sb0 in PBR policies.'),'Применено. PBR перезагружается в фоне. Выберите sb0 в правилах PBR.');
+assert.equal(i.tr('Command failed: /usr/bin/sing-box'),'Ошибка команды: /usr/bin/sing-box');
+assert.equal(i.tr('Ручной конфиг сохранён и применён. Служба выключена; конфиг будет использован после включения.'),'Ручной конфиг сохранён и применён. Служба выключена; конфиг будет использован после включения.');
+assert.equal(i.locale(),'ru-RU');
+assert.equal(i.tr('provider supplied node name'),'provider supplied node name');
+console.log('PASS: complete translation catalogue, dynamic messages, errors, locale and user text preservation');

@@ -1,0 +1,4 @@
+#!/bin/sh
+core=/etc/singbox-gui/core/sing-box
+[ -x "$core" ] || core=/usr/bin/sing-box
+exec "$core" "$@"

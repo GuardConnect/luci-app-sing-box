@@ -1,0 +1,1507 @@
+#!/usr/bin/python3
+"""LuCI RPC backend. Never passes subscription input through a shell."""
+import base64
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from threading import Lock
+import copy
+import fcntl
+import hashlib
+import ipaddress
+from itertools import zip_longest
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import struct
+import shutil
+import signal
+import select
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from urllib.parse import urlsplit, parse_qs, unquote
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import singbox_routing as routing
+
+STORE = Path('/etc/singbox-gui')
+RUN = Path('/var/run/singbox-gui')
+LIMIT = 2 * 1024 * 1024
+
+
+def core_binary():
+    custom = STORE / 'core' / 'sing-box'
+    return str(custom) if os.access(custom, os.X_OK) else '/usr/bin/sing-box'
+
+
+def core_version():
+    text = run(core_binary(), 'version', check=False)
+    match = re.search(r'sing-box version (\S+)', text)
+    return match.group(1) if match else 'unknown'
+
+
+def run(*args, check=True, timeout=35):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if not check:
+            return ''
+        raise ValueError('Command timed out: ' + args[0]) from None
+    if check and p.returncode:
+        # Do not expose command arguments (subscription URLs and UUIDs).
+        raise ValueError('Command failed: ' + args[0] + ': ' + p.stderr[-1200:])
+    return p.stdout.strip()
+
+
+def uci(key, default=''):
+    return run('uci', '-q', 'get', key, check=False) or default
+
+
+def settings():
+    defaults = dict(enabled='0', log_level='info', selected='', subscription='', hwid_enabled='0', hwid='',
+                    subscription_user_agent='', subscription_user_agent_mode='auto', device_os='OpenWrt',
+                    device_os_version='25.12.6', device_model='Router', dns='https://1.1.1.1/dns-query',
+                    bootstrap_dns='1.1.1.1', dns_mode='https_dns_proxy', dns_detour='proxy', interface='sbvpn',
+                    device='sb-tun0', address='172.30.255.1/30', mtu='1400',
+                    uplink='eth0', source_zone='lan', manage_firewall='1', manual_enabled='0', probe_method='tcp_connect',
+                    probe_url_preset='google', probe_custom_url='', probe_timeout='8', probe_dns='default')
+    return {k: uci('singbox_gui.main.' + k, v) for k, v in defaults.items()}
+
+
+def atomic(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def load_subscriptions():
+    path = STORE / 'subscriptions.json'
+    if path.exists():
+        return json.loads(path.read_text())
+    p = STORE / 'nodes.json'
+    legacy = json.loads(p.read_text()) if p.exists() else []
+    url = uci('singbox_gui.main.subscription')
+    if not url and not legacy:
+        return []
+    return [dict(id='primary', name=urlsplit(url).hostname or 'Импортированные ссылки',
+                 url=url, nodes=legacy, updated_at=0)]
+
+
+def load_nodes():
+    merged = {}
+    for source in load_subscriptions():
+        for node in source.get('nodes', []):
+            if node['id'] not in merged:
+                merged[node['id']] = dict(node, subscription_ids=[])
+            merged[node['id']]['subscription_ids'].append(source['id'])
+    return list(merged.values())
+
+
+def source_settings(source):
+    config = dict(settings())
+    if source.get('hwid'):
+        config.update(hwid_enabled='1', hwid=source['hwid'])
+    return config
+
+
+def subscription_action(method, args):
+    sources = load_subscriptions()
+    if method == 'subscriptions':
+        return dict(ok=True, default_id=next((s['id'] for s in sources if s.get('default')), sources[0]['id'] if sources else ''),
+                    subscriptions=[dict(id=s['id'], name=s['name'], url=s['url'], default=bool(s.get('default')),
+                    update_interval=s.get('update_interval', 0), last_attempt=s.get('last_attempt', 0), last_error=s.get('last_error', ''), hwid=s.get('hwid', ''),
+                    count=len(s.get('nodes', [])), updated_at=s.get('updated_at', 0)) for s in sources])
+    source_id = args.get('id', '')
+    source = next((s for s in sources if s['id'] == source_id), None)
+    if method == 'subscription_save':
+        name, url = args.get('name', '').strip(), args.get('url', '').strip()
+        p = urlsplit(url)
+        if not name:
+            name = p.hostname or 'Импортированные ссылки'
+            base, suffix = name, 2
+            while any(s['id'] != source_id and s['name'] == name for s in sources):
+                name = base + ' (' + str(suffix) + ')'
+                suffix += 1
+        if len(name) > 80 or any(ord(c) < 32 for c in name):
+            raise ValueError('Введите название подписки: от 1 до 80 символов.')
+        if url and (p.scheme != 'https' or not p.hostname or p.username or p.password or
+                    len(url) > 4096 or any(ord(c) < 33 for c in url)):
+            raise ValueError('Введите корректный HTTPS URL подписки.')
+        if source_id and source is None:
+            raise ValueError('Подписка не найдена. Обновите страницу.')
+        if source is None:
+            if len(sources) >= 20:
+                raise ValueError('Можно добавить не более 20 подписок.')
+            source = dict(id=uuid.uuid4().hex[:16], nodes=[], updated_at=0)
+            sources.append(source)
+        source.update(name=name, url=url)
+        interval = str(args.get('update_interval', source.get('update_interval', 0)))
+        if not interval.isdigit() or (int(interval) != 0 and not 5 <= int(interval) <= 10080):
+            raise ValueError('Интервал: 0 для отключения или от 5 до 10080 минут.')
+        if int(interval) and not url:
+            raise ValueError('Для автообновления укажите URL подписки.')
+        source['update_interval'] = int(interval)
+        if str(args.get('default', '')).lower() in ('1', 'true'):
+            for item in sources:
+                item['default'] = item['id'] == source['id']
+        elif not any(item.get('default') for item in sources):
+            sources[0]['default'] = True
+    elif source is None:
+        raise ValueError('Подписка не найдена. Обновите страницу.')
+    elif method in ('subscription_refresh', 'subscription_reregister'):
+        if not source['url']:
+            raise ValueError('Для обновления укажите HTTPS URL подписки.')
+        candidate = dict(source)
+        if method == 'subscription_reregister':
+            candidate['hwid'] = str(uuid.uuid4())
+        parsed, errors = parse_subscription(fetch_subscription(source['url'], source_settings(candidate)))
+        other_ids = {n['id'] for item in sources if item['id'] != source_id for n in item.get('nodes', [])}
+        lost = routing.references(routing_load()) & {n['id'] for n in source.get('nodes', [])} - {n['id'] for n in parsed} - other_ids
+        if lost:
+            raise ValueError('The update removes a server used by routing rules. Update the routing profile first')
+        if method == 'subscription_reregister':
+            source['hwid'] = candidate['hwid']
+        source.update(nodes=parsed, updated_at=int(time.time()), last_attempt=int(time.time()), last_error='')
+    elif method == 'subscription_delete':
+        other_ids = {n['id'] for s in sources if s['id'] != source_id for n in s.get('nodes', [])}
+        if routing.references(routing_load()) & {n['id'] for n in source.get('nodes', [])} - other_ids:
+            raise ValueError('A server from this subscription is used by routing rules')
+        sources.remove(source)
+        if sources and not any(item.get('default') for item in sources):
+            sources[0]['default'] = True
+    else:
+        raise ValueError('Unknown subscription method')
+    atomic(STORE / 'subscriptions.json', sources)
+    return dict(ok=True, id=source['id'], count=len(source.get('nodes', [])),
+                message='Подписка загружена с новым HWID.' if method == 'subscription_reregister' else 'Подписка обновлена.' if method == 'subscription_refresh' else 'Изменения подписки сохранены.')
+
+
+def refresh_due():
+    """Download outside the RPC lock; commit only if the source has not changed."""
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(RUN / 'subscription-worker.lock', 'w') as worker:
+        try:
+            fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        with open(RUN / 'lock', 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            sources = load_subscriptions()
+            now = int(time.time())
+            due = [s for s in sources if s.get('url') and int(s.get('update_interval', 0)) > 0 and
+                   now >= max(s.get('updated_at', 0), s.get('last_attempt', 0)) + int(s['update_interval']) * 60]
+            if not due:
+                return
+            source = min(due, key=lambda s: max(s.get('updated_at', 0), s.get('last_attempt', 0)))
+            snapshot = dict(source)
+            source['last_attempt'] = now
+            atomic(STORE / 'subscriptions.json', sources)
+        try:
+            parsed, _ = parse_subscription(fetch_subscription(snapshot['url'], source_settings(snapshot)))
+            error = ''
+        except Exception as exc:
+            parsed, error = None, str(exc)[:240]
+        with open(RUN / 'lock', 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            sources = load_subscriptions()
+            source = next((s for s in sources if s['id'] == snapshot['id']), None)
+            if not source or source.get('url') != snapshot['url'] or source.get('hwid') != snapshot.get('hwid') or source.get('update_interval', 0) != snapshot.get('update_interval', 0) or source.get('last_attempt') != now or source.get('updated_at', 0) != snapshot.get('updated_at', 0):
+                return
+            source['last_error'] = error
+            if parsed is not None:
+                other_ids = {n['id'] for s in sources if s['id'] != source['id'] for n in s.get('nodes', [])}
+                critical = routing.references(routing_load())
+                if critical & {n['id'] for n in source.get('nodes', [])} - {n['id'] for n in parsed} - other_ids:
+                    source['last_error'] = 'Выбранный сервер отсутствует в обновлении. Выберите другой сервер и обновите подписку вручную.'
+                else:
+                    source.update(nodes=parsed, updated_at=int(time.time()))
+            atomic(STORE / 'subscriptions.json', sources)
+            return True
+
+
+def install_schedule(path=None):
+    path = path or Path('/etc/crontabs/root')
+    existing = path.read_text() if path.exists() else ''
+    marker = '# luci-singbox-subscriptions'
+    lines = [line for line in existing.splitlines() if marker not in line]
+    lines.append('* * * * * /usr/libexec/singbox-gui refresh-due >/dev/null 2>&1 ' + marker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(lines) + '\n')
+    path.chmod(0o600)
+    run('/etc/init.d/cron', 'enable')
+    run('/etc/init.d/cron', 'restart')
+
+
+def parse_vless(uri):
+    p = urlsplit(uri)
+    if p.scheme != 'vless' or not p.hostname or not p.port or not p.username:
+        raise ValueError('Invalid VLESS URI')
+    ident = str(uuid.UUID(unquote(p.username)))
+    q = {k: v[-1] for k, v in parse_qs(p.query, keep_blank_values=True).items()}
+    known = {'type', 'security', 'encryption', 'flow', 'sni', 'serverName', 'fp', 'pbk',
+             'sid', 'spx', 'alpn', 'allowInsecure', 'insecure', 'host', 'path', 'serviceName',
+             'mode', 'packetEncoding', 'headerType', 'authority'}
+    if set(q) - known:
+        raise ValueError('Unsupported VLESS parameter: ' + ', '.join(sorted(set(q) - known)))
+    if q.get('encryption', 'none') != 'none':
+        raise ValueError('VLESS encryption other than none is not supported')
+    if q.get('headerType', 'none') != 'none':
+        raise ValueError('TCP HTTP header camouflage is not supported')
+    if q.get('mode', 'gun') not in ('gun', ''):
+        raise ValueError('Unsupported gRPC mode')
+    if q.get('allowInsecure', q.get('insecure', '0')).lower() not in ('0', 'false', ''):
+        raise ValueError('Insecure TLS is not accepted')
+    out = dict(type='vless', tag='proxy', server=p.hostname, server_port=p.port, uuid=ident)
+    flow = q.get('flow', '')
+    if flow:
+        if flow != 'xtls-rprx-vision':
+            raise ValueError('Unsupported VLESS flow')
+        out['flow'] = flow
+    security = q.get('security', 'none')
+    if security not in ('none', 'tls', 'reality'):
+        raise ValueError('Unsupported TLS mode')
+    if security != 'none':
+        tls = dict(enabled=True, server_name=q.get('sni', q.get('serverName', p.hostname)))
+        if q.get('alpn'):
+            tls['alpn'] = q['alpn'].split(',')
+        if q.get('fp'):
+            tls['utls'] = dict(enabled=True, fingerprint=q['fp'])
+        if security == 'reality':
+            if not q.get('pbk'):
+                raise ValueError('Reality public key is missing')
+            tls['reality'] = dict(enabled=True, public_key=q['pbk'], short_id=q.get('sid', ''))
+            tls.setdefault('utls', dict(enabled=True, fingerprint='chrome'))
+        out['tls'] = tls
+    transport = q.get('type', 'tcp')
+    if transport == 'ws':
+        out['transport'] = dict(type='ws', path=q.get('path', '/'))
+        if q.get('host'):
+            out['transport']['headers'] = {'Host': q['host']}
+    elif transport == 'grpc':
+        out['transport'] = dict(type='grpc', service_name=q.get('serviceName', ''))
+    elif transport in ('http', 'h2'):
+        out['transport'] = dict(type='http', path=q.get('path', '/'))
+        if q.get('host'):
+            out['transport']['host'] = q['host'].split(',')
+    elif transport != 'tcp':
+        raise ValueError('Unsupported transport: ' + transport)
+    if q.get('packetEncoding'):
+        if q['packetEncoding'] not in ('xudp', 'packetaddr'):
+            raise ValueError('Unsupported packet encoding')
+        out['packet_encoding'] = q['packetEncoding']
+    canonical = json.dumps(out, sort_keys=True).encode()
+    return dict(id=hashlib.sha256(canonical).hexdigest()[:24],
+                name=unquote(p.fragment) or p.hostname + ':' + str(p.port), outbound=out)
+
+
+def parse_subscription(text):
+    text = text.lstrip('\ufeff').strip()
+    if not text.startswith('vless://'):
+        try:
+            compact = ''.join(text.split())
+            text = base64.b64decode(compact + '=' * (-len(compact) % 4), altchars=b'-_', validate=True).decode('utf-8')
+        except Exception:
+            raise ValueError('Expected VLESS URI list or base64 VLESS subscription') from None
+    nodes, errors, seen = [], [], set()
+    for index, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if not line.startswith('vless://'):
+            errors.append('Line %d: not a VLESS URI' % index)
+            continue
+        try:
+            node = parse_vless(line)
+            if node['id'] not in seen:
+                nodes.append(node)
+                seen.add(node['id'])
+        except (ValueError, TypeError) as e:
+            errors.append('Line %d: %s' % (index, e))
+    if not nodes:
+        raise ValueError('; '.join(errors[:8]) or 'No VLESS nodes found')
+    if len(nodes) > 1000:
+        raise ValueError('Maximum 1000 nodes')
+    return nodes, errors
+
+
+def subscription_headers(s):
+    custom = s.get('subscription_user_agent', '')
+    mode = s.get('subscription_user_agent_mode', 'custom' if custom else 'auto')
+    headers = {'User-Agent': ('sing-box/' + core_version()) if mode == 'auto' or not custom else custom}
+    if s.get('hwid_enabled') == '1':
+        hwid = s.get('hwid', '')
+        if not re.fullmatch(r'[a-zA-Z0-9._:-]{1,256}', hwid):
+            raise ValueError('Set or generate a valid HWID first')
+        headers['x-hwid'] = hwid
+        for key, header in [('device_os', 'x-device-os'), ('device_os_version', 'x-ver-os'),
+                            ('device_model', 'x-device-model')]:
+            if s.get(key):
+                headers[header] = s[key]
+    for value in headers.values():
+        if not value or len(value) > 512 or any(ord(c) < 32 or ord(c) > 126 for c in value):
+            raise ValueError('Subscription headers must contain printable ASCII without line breaks')
+    return headers
+
+
+def fetch_subscription(url, s):
+    p = urlsplit(url)
+    if p.scheme != 'https' or not p.hostname or p.username or p.password:
+        raise ValueError('Subscription must be an HTTPS URL without userinfo')
+    # Bounded file download, verified TLS, HTTPS-only redirects, no shell.
+    with tempfile.NamedTemporaryFile(dir=str(RUN)) as f, tempfile.NamedTemporaryFile(dir=str(RUN), suffix='.headers') as headers_file:
+        # Scheduled refresh downloads outside the RPC lock. Each request owns
+        # its header file so another source cannot overwrite its HWID response.
+        header_file = Path(headers_file.name)
+        headers = []
+        for name, value in subscription_headers(s).items():
+            headers.extend(['--header', name + ': ' + value])
+        result = subprocess.run(['curl', '--silent', '--fail', '--location', '--proto', '=https',
+                                 '--proto-redir', '=https', '--max-redirs', '3', '--max-time', '22',
+                                 '--max-filesize', str(LIMIT), '--dump-header', str(header_file), '--output', f.name] + headers +
+                                 ['--', url], capture_output=True, timeout=25)
+        response_headers = header_file.read_text(errors='replace').lower() if header_file.exists() else ''
+        if re.search(r'^x-hwid-(?:max-devices-reached|limit):\s*true', response_headers, re.M):
+            raise ValueError('Subscription provider reports that the HWID device limit has been reached')
+        if re.search(r'^x-hwid-not-supported:\s*true', response_headers, re.M):
+            raise ValueError('Subscription provider requires HWID: enable HWID and set an identifier')
+        if result.returncode:
+            raise ValueError('Subscription download failed (curl code %d)' % result.returncode)
+        data = f.read(LIMIT + 1)
+        if len(data) > LIMIT:
+            raise ValueError('Subscription exceeds 2 MiB')
+        return data.decode('utf-8-sig')
+
+
+def validate_interface_settings(s):
+    for key, pattern in [('interface', r'[a-zA-Z][a-zA-Z0-9_]{0,14}'),
+                         ('device', r'[a-zA-Z][a-zA-Z0-9_-]{0,14}'),
+                         ('uplink', r'[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,14}'),
+                         ('source_zone', r'[a-zA-Z][a-zA-Z0-9_]{0,14}')]:
+        if not re.fullmatch(pattern, s[key]):
+            raise ValueError('Invalid ' + key)
+    addr = ipaddress.ip_interface(s['address'])
+    if addr.version != 4 or addr.network.prefixlen != 30 or not addr.is_private:
+        raise ValueError('TUN address must be a private IPv4 /30')
+    mtu = int(s['mtu'])
+    if not 1280 <= mtu <= 9000:
+        raise ValueError('MTU must be 1280..9000')
+    return addr, mtu
+
+
+def config(s, node, with_routing=True):
+    addr, mtu = validate_interface_settings(s)
+    mode = s.get('dns_mode', 'https_dns_proxy')
+    if mode not in ('https_dns_proxy', 'external'):
+        raise ValueError('Invalid DNS mode')
+    bootstrap = str(ipaddress.ip_address(s['bootstrap_dns'])) if mode == 'external' else '127.0.0.1'
+    if mode == 'external' and s['dns_detour'] not in ('proxy', 'direct'):
+        raise ValueError('Invalid DNS detour')
+    dns_value = s['dns'] if mode == 'external' else 'udp://127.0.0.1'
+    if '://' in dns_value:
+        dnsurl = dns_value
+    else:
+        try:
+            literal = ipaddress.ip_address(dns_value)
+            dnsurl = 'udp://' + ('[' + str(literal) + ']' if literal.version == 6 else str(literal))
+        except ValueError:
+            dnsurl = 'udp://' + dns_value
+    d = urlsplit(dnsurl)
+    if d.scheme not in ('udp', 'tcp', 'tls', 'https') or not d.hostname or d.username or d.password or d.fragment or d.query or d.port == 0:
+        raise ValueError('DNS must be an IP or udp://, tcp://, tls://, https:// URL')
+    if d.scheme != 'https' and d.path not in ('', '/'):
+        raise ValueError('Only HTTPS DNS supports a path')
+    remote = dict(type=d.scheme, tag='remote', server=d.hostname, detour=s['dns_detour'] if mode == 'external' else 'direct')
+    if d.port:
+        remote['server_port'] = d.port
+    if d.scheme == 'https':
+        remote['path'] = d.path or '/dns-query'
+    try:
+        ipaddress.ip_address(d.hostname)
+    except ValueError:
+        remote['domain_resolver'] = 'bootstrap'
+    proxy = copy.deepcopy(node['outbound']) if node else dict(type='direct', tag='proxy')
+    proxy['bind_interface'] = s['uplink']
+    proxy['routing_mark'] = 0
+    proxy['domain_resolver'] = 'bootstrap'
+    log_level = s.get('log_level', 'info')
+    if log_level not in ('trace', 'debug', 'info', 'warn', 'error', 'fatal', 'panic', 'disabled'):
+        raise ValueError('Invalid log level')
+    result = dict(log=dict(level='info' if log_level == 'disabled' else log_level, disabled=log_level == 'disabled', timestamp=True),
+                dns=dict(servers=[dict(type='udp', tag='bootstrap', server=bootstrap, detour='direct'), remote], final='remote', strategy='ipv4_only'),
+                inbounds=[dict(type='tun', tag='tun-in', interface_name=s['device'], address=[str(addr)],
+                               mtu=mtu, auto_route=False, auto_redirect=False, stack='system')],
+                outbounds=[proxy, dict(type='direct', tag='direct', bind_interface=s['uplink'], routing_mark=0)],
+                route=dict(auto_detect_interface=False, default_domain_resolver='bootstrap',
+                           rules=[dict(inbound=['tun-in'], port=53, action='hijack-dns')], final='proxy'))
+    if mode == 'https_dns_proxy':
+        # Send even captured DNS back through dnsmasq, preserving HTTPS DNS Proxy
+        # ownership, PBR nftset population, local names and dnsmasq cache.
+        # A dedicated loopback-bound dialer avoids an uplink binding for 127.0.0.1.
+        result['outbounds'].append(dict(type='direct', tag='dns-local', bind_interface='lo'))
+        result['dns'] = dict(servers=[dict(type='udp', tag='router-dns', server='127.0.0.1',
+                                          server_port=53, detour='dns-local')],
+                             final='router-dns', strategy='ipv4_only')
+        result['route']['default_domain_resolver'] = 'router-dns'
+        result['outbounds'][0]['domain_resolver'] = 'router-dns'
+    profile = routing_load() if with_routing else routing.defaults()
+    if with_routing and profile.get('enabled'):
+        result, _ = routing.compile_profile(profile, result, load_nodes(), s, STORE)
+    return result
+
+
+def routing_load():
+    path = STORE / 'routing.json'
+    profile = json.loads(path.read_text()) if path.exists() else routing.defaults()
+    # Migrate the removed global-server alias into an explicit subscription node.
+    selected = uci('singbox_gui.main.selected')
+    for rule in profile.get('rules', []):
+        if rule.get('outbound') == 'proxy':
+            rule['outbound'] = 'node:' + selected if selected else 'direct'
+    if profile.get('final') == 'proxy':
+        profile['final'] = 'direct'
+    profile.pop('name', None)
+    return routing.normalize(profile)
+
+
+def routing_job(method, args):
+    folder = RUN / 'routing-jobs'
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if method == 'routing_get':
+        active = None
+        for path in sorted(folder.glob('*.json'), key=lambda item:item.stat().st_mtime, reverse=True):
+            if not re.fullmatch('[a-f0-9]{32}', path.stem) or time.time() - path.stat().st_mtime >= 600:
+                continue
+            if json.loads(path.read_text()).get('state') == 'running' and (folder / (path.stem + '-request.json')).exists():
+                try:
+                    request = json.loads((folder / (path.stem + '-request.json')).read_text())
+                except FileNotFoundError:
+                    continue
+                active = dict(id=path.stem, mode=request['mode'], profile=request['profile'])
+                break
+        return dict(ok=True, profile=routing_load(), job=active, manual=settings()['manual_enabled'] == '1',
+                    nodes=[dict(id=n['id'], name=n['name'], server=n['outbound']['server'], port=n['outbound']['server_port']) for n in load_nodes()])
+    if method == 'routing_start':
+        for current in folder.glob('*.json'):
+            if time.time() - current.stat().st_mtime < 600 and json.loads(current.read_text()).get('state') == 'running':
+                raise ValueError('A routing operation is already in progress')
+        profile = routing.normalize(json.loads(args.get('text', '{}')))
+        mode = args.get('mode', 'check')
+        if mode not in ('check', 'save', 'apply'):
+            raise ValueError('Invalid routing operation')
+        for old in folder.glob('*.json'):
+            if time.time() - old.stat().st_mtime > 3600:
+                old.unlink(missing_ok=True)
+        ident = uuid.uuid4().hex
+        atomic(folder / (ident + '-request.json'), dict(profile=profile, mode=mode))
+        atomic(folder / (ident + '.json'), dict(ok=True, state='running', message='Validating routing profile'))
+        subprocess.Popen([sys.executable, __file__, 'routing-worker', ident], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return dict(ok=True, job=ident)
+    ident = args.get('job', '')
+    if not re.fullmatch('[a-f0-9]{32}', ident) or not (folder / (ident + '.json')).exists():
+        raise ValueError('Routing job expired; run the operation again')
+    return json.loads((folder / (ident + '.json')).read_text())
+
+
+def routing_worker(ident):
+    if not re.fullmatch('[a-f0-9]{32}', ident):
+        return
+    folder = RUN / 'routing-jobs'
+    request = folder / (ident + '-request.json')
+    response = folder / (ident + '.json')
+    try:
+        job = json.loads(request.read_text())
+        profile, mode = job['profile'], job['mode']
+        s, nodes = settings(), load_nodes()
+        if mode == 'apply' and s['manual_enabled'] == '1':
+            raise ValueError('Return to GUI configuration before applying routing rules')
+        if mode == 'apply':
+            for name in managed_configs():
+                if run('uci', 'changes', name):
+                    raise ValueError('Apply or discard pending changes in ' + name + ' first')
+        selected = next((n for n in nodes if n['id'] == s['selected']), None)
+        base = config(s, None, with_routing=False)
+        if mode == 'apply' and profile.get('capture_mode') == 'automatic' and uci('pbr.config.enabled', '0') == '1':
+            raise ValueError('Disable PBR before enabling automatic routes')
+        compiled, required = routing.compile_profile(profile, base, nodes, s, STORE, force=mode != 'apply')
+        if required:
+            version = re.match(r'^(\d+)\.(\d+)', core_version())
+            if not version or tuple(map(int, version.groups())) < (1, 14):
+                raise ValueError('Remote routing rule-sets require Sing-box 1.14 or newer')
+        atomic(response, dict(ok=True, state='running', message='Preparing rule-sets'))
+        with tempfile.TemporaryDirectory(prefix='routing-', dir=str(RUN)) as directory:
+            stage = Path(directory)
+            budget, budget_lock = [0], Lock()
+            def prepare(item):
+                path = Path(item['path'])
+                if path.exists():
+                    return item['url'], str(path)
+                with budget_lock:
+                    if budget[0] >= 67108864:
+                        raise ValueError('Routing rule-set download budget exceeded')
+                target = stage / (hashlib.sha256(item['url'].encode()).hexdigest() + path.suffix)
+                result = subprocess.run(['curl', '--silent', '--show-error', '--fail', '--location', '--proto', '=https', '--proto-redir', '=https',
+                    '--max-redirs', '3', '--max-time', '25', '--max-filesize', '16777216', '--interface', s['uplink'], '--output', str(target), '--', item['url']], capture_output=True, timeout=28)
+                if result.returncode or not target.exists() or target.stat().st_size > 16777216:
+                    raise ValueError('Rule-set download failed: ' + item['tag'])
+                with budget_lock:
+                    budget[0] += target.stat().st_size
+                    if budget[0] > 67108864:
+                        raise ValueError('Routing rule-set download budget exceeded')
+                return item['url'], str(target)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                by_url = dict(pool.map(prepare, {item['url']:item for item in required}.values()))
+                paths = {item['tag']:by_url[item['url']] for item in required}
+            checked = copy.deepcopy(compiled)
+            if required:
+                checked['route']['rule_set'] = [dict(type='local', tag=item['tag'], format=item['format'], path=paths[item['tag']]) for item in required]
+            candidate = stage / 'config.json'
+            atomic(candidate, checked)
+            run(core_binary(), 'check', '-c', str(candidate))
+            if mode != 'check':
+                with open(RUN / 'lock', 'w') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    path = STORE / 'routing.json'
+                    old = path.read_bytes() if path.exists() else None
+                    runtime = RUN / 'config.json'
+                    old_runtime = runtime.read_bytes() if runtime.exists() else None
+                    restart_attempted = False
+                    applied = False
+                    state = json.loads(run('ubus', 'call', 'service', 'list', '{"name":"singbox-gui"}'))
+                    was_running = any(item.get('running') for item in state.get('singbox-gui', {}).get('instances', {}).values())
+                    for item in required:
+                        target = Path(item['path'])
+                        if not target.exists():
+                            target.parent.mkdir(mode=0o700, exist_ok=True)
+                            fd, temporary = tempfile.mkstemp(dir=str(target.parent))
+                            try:
+                                with os.fdopen(fd, 'wb') as output, open(paths[item['tag']], 'rb') as source:
+                                    shutil.copyfileobj(source, output)
+                                os.replace(temporary, target)
+                            finally:
+                                Path(temporary).unlink(missing_ok=True)
+                    if old is not None:
+                        backup = STORE / ('routing-backup-' + str(int(time.time())) + '-' + ident[:6] + '.json')
+                        backup.write_bytes(old); backup.chmod(0o600)
+                    try:
+                        if mode == 'apply' and settings()['manual_enabled'] == '1':
+                            raise ValueError('Return to GUI configuration before applying routing rules')
+                        if mode == 'apply':
+                            for name in managed_configs():
+                                if run('uci', 'changes', name):
+                                    raise ValueError('Apply or discard pending changes in ' + name + ' first')
+                        # Downloads run outside this lock. A subscription or
+                        # settings may have changed meanwhile; validate again
+                        # before committing a profile that could no longer run.
+                        current_settings = settings()
+                        compiled, current_required = routing.compile_profile(profile,
+                            config(current_settings, None, with_routing=False), load_nodes(),
+                            current_settings, STORE, force=mode != 'apply')
+                        current_checked = copy.deepcopy(compiled)
+                        if current_required:
+                            version = re.match(r'^(\d+)\.(\d+)', core_version())
+                            if not version or tuple(map(int, version.groups())) < (1, 14):
+                                raise ValueError('Remote routing rule-sets require Sing-box 1.14 or newer')
+                            current_checked['route']['rule_set'] = [dict(type='local', tag=item['tag'],
+                                format=item['format'], path=item['path']) for item in current_required]
+                        atomic(candidate, current_checked)
+                        run(core_binary(), 'check', '-c', str(candidate))
+                        atomic(path, profile)
+                        if mode == 'apply' and settings()['enabled'] == '1':
+                            active = generate()
+                            if uci('network.' + active['interface']) != 'interface':
+                                raise ValueError('Create the OpenWrt interface before applying routing')
+                            atomic(response, dict(ok=True, state='running', message='Applying routing rules'))
+                            restart_attempted = True
+                            run('/etc/init.d/singbox-gui', 'restart')
+                            for _ in range(100):
+                                if Path('/sys/class/net/' + active['device']).exists():
+                                    break
+                                time.sleep(0.15)
+                            else:
+                                raise ValueError('TUN did not appear after applying routing')
+                            # ifup also triggers the package hotplug hook to refresh PBR's TUN table.
+                            run('/sbin/ifup', active['interface'])
+                            applied = True
+                    except Exception:
+                        if old is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            path.write_bytes(old)
+                        if old_runtime is not None:
+                            runtime.write_bytes(old_runtime)
+                        else:
+                            runtime.unlink(missing_ok=True)
+                        if restart_attempted:
+                            run('/etc/init.d/singbox-gui', 'restart' if was_running else 'stop', check=False)
+                            if was_running:
+                                run('/sbin/ifup', settings()['interface'], check=False)
+                        raise
+        message = {'check':'Routing profile is valid', 'save':'Routing profile saved', 'apply':'Routing profile saved and applied'}[mode]
+        if mode == 'apply' and not applied:
+            message = 'Routing profile saved; enable Sing-box to apply it'
+        atomic(response, dict(ok=True, state='done', message=message, preview=compiled['route']))
+    except Exception as error:
+        atomic(response, dict(ok=False, state='done', error=str(error)))
+    finally:
+        request.unlink(missing_ok=True)
+
+
+def ensure_capture_compatibility(data):
+    automatic = any(item.get('type') == 'tun' and (item.get('auto_route') or item.get('auto_redirect'))
+                    for item in data.get('inbounds', []))
+    if automatic and uci('pbr.config.enabled', '0') == '1':
+        raise ValueError('Disable PBR before enabling automatic routes')
+
+
+def generate():
+    s = settings()
+    recovery = RUN / 'recovery.json'
+    if recovery.exists():
+        # A failed apply or core change must restart the validated runtime,
+        # rather than regenerate it from settings which have not worked yet.
+        data = json.loads(recovery.read_text())
+    elif s['manual_enabled'] == '1':
+        data = json.loads((STORE / 'manual.json').read_text())
+        validate_manual(data, s)
+    else:
+        profile = routing_load()
+        if profile.get('capture_mode') == 'automatic' and uci('pbr.config.enabled', '0') == '1':
+            raise ValueError('Disable PBR before enabling automatic routes')
+        data = config(s, None)
+    ensure_capture_compatibility(data)
+    candidate = RUN / 'candidate.json'
+    atomic(candidate, data)
+    run(core_binary(), 'check', '-c', str(candidate))
+    os.replace(candidate, RUN / 'config.json')
+    recovery.unlink(missing_ok=True)
+    return s
+
+
+def validate_manual(data, s):
+    if not isinstance(data, dict):
+        raise ValueError('Configuration must be a JSON object')
+    tunnels = [i for i in data.get('inbounds', []) if isinstance(i, dict) and i.get('type') == 'tun']
+    if len(tunnels) != 1 or tunnels[0].get('interface_name') != s['device']:
+        raise ValueError('Keep one TUN inbound with the managed interface_name: ' + s['device'])
+    if routing_load().get('capture_mode') != 'automatic' and (tunnels[0].get('auto_route') or tunnels[0].get('auto_redirect')):
+        raise ValueError('PBR mode requires auto_route=false and auto_redirect=false')
+    ensure_capture_compatibility(data)
+
+
+def config_editor(action, text=''):
+    path = STORE / 'manual.json'
+    s = settings()
+    if action == 'config_get':
+        current = path if s['manual_enabled'] == '1' else RUN / 'config.json'
+        if not current.exists():
+            generate()
+            current = RUN / 'config.json'
+        return dict(ok=True, text=current.read_text(), manual=s['manual_enabled'] == '1')
+    old = path.read_bytes() if path.exists() else None
+    if action == 'config_save':
+        if len(text.encode()) > LIMIT - 1024:
+            raise ValueError('Configuration too large')
+        data = json.loads(text)
+        validate_manual(data, s)
+        with tempfile.TemporaryDirectory(prefix='validate-', dir=str(RUN)) as directory:
+            candidate = Path(directory) / 'config.json'
+            atomic(candidate, data)
+            run(core_binary(), 'check', '-c', str(candidate))
+        atomic(path, data)
+        mode = '1'
+    else:
+        mode = '0'
+    run('uci', 'set', 'singbox_gui.main.manual_enabled=' + mode)
+    run('uci', 'commit', 'singbox_gui')
+    try:
+        response = apply()
+    except Exception:
+        if old is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(old)
+        run('uci', 'set', 'singbox_gui.main.manual_enabled=' + s['manual_enabled'])
+        run('uci', 'commit', 'singbox_gui')
+        if s['enabled'] == '1':
+            run('/etc/init.d/singbox-gui', 'restart', check=False)
+        raise
+    response['manual'] = mode == '1'
+    response['message'] = 'Ручной конфиг сохранён и применён.' if mode == '1' else 'Включена генерация конфигурации из GUI.'
+    if s['enabled'] != '1':
+        response['message'] += ' Служба выключена; конфиг будет использован после включения.'
+    return response
+
+
+def configure_network(s):
+    iface = s['interface']
+    owned = STORE / 'interface.json'
+    previous = json.loads(owned.read_text()) if owned.exists() else None
+    marker = uci('network.' + iface + '.singbox_gui')
+    if uci('network.' + iface) and marker != '1':
+        raise ValueError('Network interface already exists and is not owned by this app')
+    if Path('/sys/class/net/' + s['device']).exists() and marker != '1' and not (previous and previous['device'] == s['device'] and uci('network.' + previous['interface'] + '.singbox_gui') == '1'):
+        raise ValueError('TUN device already exists and is not owned by this app')
+    if previous and any(previous[k] != s[k] for k in ('device', 'source_zone')):
+        raise ValueError('TUN device and source zone cannot be changed after creation')
+    for name in ('singbox_gui', 'singbox_gui_lan'):
+        if uci('firewall.' + name) and uci('firewall.' + name + '.singbox_gui') != '1':
+            raise ValueError('Firewall section conflict: ' + name)
+    use_pbr = routing_load().get('capture_mode') != 'automatic'
+    if use_pbr and not uci('pbr.config'):
+        raise ValueError('PBR configuration section pbr.config is missing')
+    zones = run('uci', '-q', 'show', 'firewall')
+    if "name='" + s['source_zone'] + "'" not in zones:
+        raise ValueError('Source firewall zone does not exist')
+    def setval(key, value):
+        run('uci', 'set', key + '=' + value)
+    if previous and previous['interface'] != iface:
+        old = previous['interface']
+        if uci('network.' + old + '.singbox_gui') != '1':
+            raise ValueError('Previous interface is missing or no longer owned by this app')
+        run('uci', 'rename', 'network.' + old + '=' + iface)
+        if use_pbr:
+            run('uci', '-q', 'del_list', 'pbr.config.supported_interface=' + old, check=False)
+            sections = json.loads(run('ubus', 'call', 'uci', 'get', '{"config":"pbr"}'))['values']
+            for name, values in sections.items():
+                if values.get('.type') == 'policy' and values.get('interface') == old:
+                    setval('pbr.' + name + '.interface', iface)
+    setval('network.' + iface, 'interface')
+    for key, value in dict(proto='none', device=s['device'], auto='1', defaultroute='0', peerdns='0', singbox_gui='1').items():
+        setval('network.' + iface + '.' + key, value)
+    if s.get('manage_firewall', '1') == '1':
+        setval('firewall.singbox_gui', 'zone')
+        # The system TUN stack redirects TCP into a local listener.
+        for key, value in dict(name='sbvpn', input='ACCEPT', output='ACCEPT', forward='REJECT', masq='0', mtu_fix='1', singbox_gui='1').items():
+            setval('firewall.singbox_gui.' + key, value)
+        run('uci', '-q', 'delete', 'firewall.singbox_gui.network', check=False)
+        run('uci', 'add_list', 'firewall.singbox_gui.network=' + iface)
+        setval('firewall.singbox_gui_lan', 'forwarding')
+        for key, value in dict(src=s['source_zone'], dest='sbvpn', singbox_gui='1').items():
+            setval('firewall.singbox_gui_lan.' + key, value)
+    if use_pbr:
+        run('uci', '-q', 'del_list', 'pbr.config.supported_interface=' + iface, check=False)
+        run('uci', 'add_list', 'pbr.config.supported_interface=' + iface)
+    for name in (('network', 'firewall', 'pbr') if use_pbr else ('network', 'firewall')):
+        run('uci', 'commit', name)
+    atomic(owned, {k: s[k] for k in ('interface', 'device', 'source_zone')})
+
+
+def reload_pbr():
+    if routing_load().get('capture_mode') == 'automatic' or not Path('/etc/init.d/pbr').exists() or uci('pbr.config.enabled', '0') != '1':
+        return
+    # PBR may resolve many domain policies. Never hold an HTTP/RPC request open
+    # while it does so. The service handles concurrent reload requests itself.
+    with open(RUN / 'pbr-reload.log', 'a') as output:
+        subprocess.Popen(['/etc/init.d/pbr', 'reload'], stdin=subprocess.DEVNULL,
+                         stdout=output, stderr=output, start_new_session=True)
+
+
+def managed_configs():
+    return tuple(name for name in ('network', 'firewall', 'pbr') if Path('/etc/config/' + name).exists())
+
+
+def create_interface(force_firewall=False):
+    s = settings()
+    validate_interface_settings(s)
+    if force_firewall:
+        s['manage_firewall'] = '1'
+    for name in managed_configs():
+        if run('uci', 'changes', name):
+            raise ValueError('Apply or discard pending changes in ' + name + ' first')
+    backup = STORE / ('network-backup-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6])
+    backup.mkdir(mode=0o700)
+    owned = STORE / 'interface.json'
+    previous = owned.read_bytes() if owned.exists() else None
+    for name in managed_configs():
+        if Path('/etc/config/' + name).exists():
+            (backup / name).write_bytes(Path('/etc/config/' + name).read_bytes())
+    try:
+        configure_network(s)
+        run('ubus', 'call', 'network', 'reload', '{}')
+        if Path('/sys/class/net/' + s['device']).exists():
+            run('/sbin/ifup', s['interface'])
+        if s.get('manage_firewall', '1') == '1':
+            run('/etc/init.d/firewall', 'reload')
+        reload_pbr()
+    except Exception:
+        for name in managed_configs():
+            run('uci', 'revert', name, check=False)
+            if (backup / name).exists():
+                Path('/etc/config/' + name).write_bytes((backup / name).read_bytes())
+        if previous is None:
+            owned.unlink(missing_ok=True)
+        else:
+            owned.write_bytes(previous)
+        run('ubus', 'call', 'network', 'reload', '{}', check=False)
+        run('/etc/init.d/firewall', 'reload', check=False)
+        reload_pbr()
+        raise
+    return dict(ok=True, message='Интерфейс OpenWrt создан. TUN поднимается при запуске Sing-box.', backup=str(backup))
+
+
+def probe_resolve(server, dns='default', uplink=''):
+    try:
+        return [str(ipaddress.ip_address(server))]
+    except ValueError:
+        pass
+    resolver = '127.0.0.1' if dns == 'default' else str(ipaddress.ip_address(dns))
+    # Query the explicitly chosen resolver directly; never parse nslookup's DNS-server line.
+    name = server.rstrip('.').encode('idna').decode('ascii')
+    labels = name.split('.')
+    if any(not label or len(label) > 63 for label in labels) or len(name) > 253:
+        raise ValueError('Invalid DNS name')
+    question = b''.join(bytes([len(label)]) + label.encode('ascii') for label in labels) + b'\0'
+    def skip_name(packet, offset):
+        for _ in range(128):
+            length = packet[offset]
+            if length & 0xc0 == 0xc0:
+                return offset + 2
+            offset += 1
+            if length == 0:
+                return offset
+            if length > 63:
+                raise ValueError('Invalid DNS response')
+            offset += length
+        raise ValueError('Invalid DNS response')
+    addresses = []
+    for kind in (1, 28):
+        ident = int.from_bytes(os.urandom(2), 'big')
+        packet = struct.pack('!6H', ident, 0x100, 1, 0, 0, 0) + question + struct.pack('!2H', kind, 1)
+        try:
+            family = socket.AF_INET6 if ':' in resolver else socket.AF_INET
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(2)
+                if uplink and not ipaddress.ip_address(resolver).is_loopback:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, uplink.encode() + b'\0')
+                sock.connect((resolver, 53)); sock.send(packet)
+                answer = sock.recv(65535)
+            if len(answer) >= 4 and struct.unpack_from('!H', answer, 2)[0] & 0x0200:
+                # Truncated UDP responses are valid DNS replies. Retry over
+                # TCP instead of reporting a working hostname as a DNS error.
+                def read_exact(sock, count):
+                    data = b''
+                    while len(data) < count:
+                        part = sock.recv(count - len(data))
+                        if not part:
+                            raise ValueError('Incomplete DNS response')
+                        data += part
+                    return data
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2)
+                    if uplink and not ipaddress.ip_address(resolver).is_loopback:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, uplink.encode() + b'\0')
+                    sock.connect((resolver, 53))
+                    sock.sendall(struct.pack('!H', len(packet)) + packet)
+                    size = struct.unpack('!H', read_exact(sock, 2))[0]
+                    answer = read_exact(sock, size)
+            mid, flags, qd, an, _, _ = struct.unpack_from('!6H', answer)
+            if mid != ident or not flags & 0x8000 or flags & 0x020f:
+                continue
+            offset = 12
+            for _ in range(qd):
+                offset = skip_name(answer, offset) + 4
+            for _ in range(an):
+                offset = skip_name(answer, offset)
+                rtype, rclass, ttl, size = struct.unpack_from('!2HIH', answer, offset); offset += 10
+                raw = answer[offset:offset+size]; offset += size
+                if rclass == 1 and ((rtype == 1 and size == 4) or (rtype == 28 and size == 16)):
+                    addresses.append(str(ipaddress.ip_address(raw)))
+        except (OSError, ValueError, IndexError, struct.error):
+            continue
+    return list(dict.fromkeys(addresses))
+
+
+def probe_icmp(address, uplink='', timeout=1.5):
+    """Three individually timed echo requests, 100 ms apart, matched to our nonce."""
+    ipv6 = ':' in address
+    family = socket.AF_INET6 if ipv6 else socket.AF_INET
+    proto = socket.IPPROTO_ICMPV6 if ipv6 else socket.IPPROTO_ICMP
+    ident = int.from_bytes(os.urandom(2), 'big')
+    nonce = os.urandom(16)
+    sent, replies = {}, {}
+    started = time.monotonic(); deadline = started + timeout
+    def checksum(data):
+        if len(data) % 2: data += b'\0'
+        value = sum(struct.unpack('!' + 'H' * (len(data) // 2), data))
+        while value >> 16: value = (value & 65535) + (value >> 16)
+        return ~value & 65535
+    try:
+        with socket.socket(family, socket.SOCK_RAW, proto) as sock:
+            if uplink:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, uplink.encode() + b'\0')
+            sock.setblocking(False)
+            seq = 0
+            while time.monotonic() < deadline:
+                now = time.monotonic()
+                if seq < 3 and now >= started + seq * .1:
+                    packet = struct.pack('!BBHHH', 128 if ipv6 else 8, 0, 0, ident, seq) + nonce
+                    if not ipv6:
+                        packet = packet[:2] + struct.pack('!H', checksum(packet)) + packet[4:]
+                    sent[seq] = time.monotonic()
+                    sock.sendto(packet, (address, 0)); seq += 1
+                remaining = deadline - time.monotonic()
+                if seq < 3: remaining = min(remaining, max(0, started + seq * .1 - time.monotonic()))
+                ready, _, _ = select.select([sock], [], [], max(0, remaining))
+                if not ready: continue
+                packet, peer = sock.recvfrom(65535); received = time.monotonic()
+                if str(ipaddress.ip_address(peer[0])) != address: continue
+                offset = 0 if ipv6 else (packet[0] & 15) * 4
+                if len(packet) < offset + 8 + len(nonce): continue
+                kind, code, _, reply_id, reply_seq = struct.unpack_from('!BBHHH', packet, offset)
+                if kind != (129 if ipv6 else 0) or code or reply_id != ident or reply_seq not in sent: continue
+                if packet[offset+8:offset+8+len(nonce)] != nonce: continue
+                replies.setdefault(reply_seq, (received-sent[reply_seq])*1000)
+                if len(replies) == 3: break
+    except (OSError, ValueError):
+        pass
+    return round(statistics.median(replies.values()), 1) if replies else None
+
+
+def probe_server(target, tcp_only=False, dns='default', uplink='', timeout=8, addresses=None):
+    server, port = target
+    result = dict(icmp_ms=None, tcp_ms=None, tcp_port=port,
+                  timestamp=int(time.time()), addresses=[], dns=dns)
+    try:
+        addresses = addresses if addresses is not None else probe_resolve(server, dns, uplink)
+        if not addresses:
+            raise ValueError('DNS lookup failed')
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        for key in ('icmp_error', 'tcp_error'):
+            result[key] = 'dns'
+        return result
+    # Interleave families before limiting attempts. A host with many A answers
+    # must still get an IPv6 attempt if its IPv4 routes are unavailable.
+    families = [[address for address in addresses if ':' not in address],
+                [address for address in addresses if ':' in address]]
+    addresses = [address for pair in zip_longest(*families) for address in pair if address]
+    result['addresses'] = addresses
+    result['icmp_error'] = 'not_run' if tcp_only else 'no_reply'
+    for address in (addresses[:2] if not tcp_only else []):
+        elapsed = probe_icmp(address, uplink, min(timeout, 1.5))
+        if elapsed is not None:
+            result['icmp_ms'], result['icmp_error'] = elapsed, None
+            break
+    # TCP runs independently: ICMP errors must never suppress this measurement.
+    for field, tcp_port in [('tcp', port)]:
+        error = 'timeout'
+        deadline = time.monotonic() + timeout
+        for address in addresses[:4]:
+            try:
+                with socket.socket(socket.AF_INET6 if ':' in address else socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(max(.1, (deadline-time.monotonic()) / max(1, min(4,len(addresses))-addresses.index(address))))
+                    if uplink:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, uplink.encode() + b'\0')
+                    started = time.monotonic()
+                    sock.connect((address, tcp_port))
+                    result['connected_address'] = address
+                    result[field + '_ms'] = round((time.monotonic() - started) * 1000, 1)
+                    error = None
+                    break
+            except ConnectionRefusedError:
+                error = 'refused'
+            except (socket.timeout, TimeoutError):
+                error = 'timeout'
+            except OSError:
+                error = 'unreachable'
+        result[field + '_error'] = error
+    return result
+
+
+PROBE_URLS = dict(google='https://www.gstatic.com/generate_204',
+                  cloudflare='https://cp.cloudflare.com/generate_204',
+                  apple='https://captive.apple.com/hotspot-detect.html')
+
+
+def probe_options(s):
+    method = s.get('probe_method', 'tcp_connect')
+    if method not in ('tcp_connect', 'url_test', 'diagnostics'):
+        raise ValueError('Invalid probe method')
+    timeout = int(s.get('probe_timeout', '5'))
+    if not 2 <= timeout <= 20:
+        raise ValueError('Probe timeout must be 2..20 seconds')
+    if s.get('probe_dns', 'default') != 'default':
+        ipaddress.ip_address(s['probe_dns'])
+    preset = s.get('probe_url_preset', 'google')
+    if preset not in (*PROBE_URLS, 'custom'):
+        raise ValueError('Invalid test URL preset')
+    url = s.get('probe_custom_url', '') if preset == 'custom' else PROBE_URLS[preset]
+    if method == 'url_test':
+        p = urlsplit(url)
+        if p.scheme not in ('https', 'http') or not p.hostname or p.username or p.password or any(ord(c) < 32 for c in url):
+            raise ValueError('Test URL must be HTTP(S), without userinfo or control characters')
+    return method, url, timeout
+
+
+def probe_url(node, s, url, timeout, job=None):
+    result = dict(method='url_test', url=url, timestamp=int(time.time()), test_ms=None, test_error='proxy_error')
+    # Each test gets a private loopback listener; the running TUN and selected
+    # production outbound are never changed. DNS follows the configured policy.
+    with tempfile.TemporaryDirectory(prefix=('probe-' + job + '-url-' if job else 'url-test-'), dir=str(RUN)) as directory:
+        directory = Path(directory)
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1', 0))
+            port = reservation.getsockname()[1]
+        test_settings = dict(s)
+        dns = s.get('probe_dns', 'default')
+        if dns != 'default':
+            ipaddress.ip_address(dns)
+            test_settings.update(dns_mode='external', dns='udp://' + ('[' + dns + ']' if ':' in dns else dns), bootstrap_dns=dns, dns_detour='direct')
+        else:
+            test_settings['dns_mode'] = 'https_dns_proxy'
+        cfg = config(test_settings, node, with_routing=False)
+        if dns != 'default' and ipaddress.ip_address(dns).is_loopback:
+            cfg['outbounds'].append(dict(type='direct', tag='dns-probe', bind_interface='lo'))
+            for entry in cfg['dns']['servers']:
+                entry['detour'] = 'dns-probe'
+        cfg['dns']['strategy'] = 'prefer_ipv4'
+        cfg['route']['rules'] = [dict(inbound=['probe'], action='resolve', server=cfg['route']['default_domain_resolver'], strategy='prefer_ipv4', disable_cache=True)]
+        cfg['route']['final'] = 'proxy'
+        cfg['inbounds'] = [dict(type='mixed', tag='probe', listen='127.0.0.1', listen_port=port)]
+        cfg['log'] = dict(level='error')
+        atomic(directory / 'config.json', cfg)
+        with open(directory / 'log', 'w') as log:
+            process = subprocess.Popen([core_binary(), 'run', '-c', str(directory / 'config.json')],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            try:
+                for _ in range(30):
+                    if process.poll() is not None:
+                        return result
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=.05):
+                            break
+                    except OSError:
+                        time.sleep(.05)
+                else:
+                    return result
+                p = subprocess.run(['curl', '--silent', '--show-error', '--output', '/dev/null',
+                                    '--proxy', 'socks5h://127.0.0.1:' + str(port), '--noproxy', '',
+                                    '--proto', '=http,https', '--max-time', str(timeout),
+                                    '--write-out', '%{http_code} %{time_starttransfer} %{time_total}', '--', url],
+                                   capture_output=True, text=True, timeout=timeout + 2)
+                fields = p.stdout.strip().split()
+                code = int(fields[0]) if fields and fields[0].isdigit() else 0
+                result['http_code'] = code
+                result['dns'] = dns
+                if len(fields) >= 3:
+                    result['total_ms'] = round(float(fields[2]) * 1000, 1)
+                if p.returncode == 0 and 200 <= code < 400 and len(fields) >= 2:
+                    result['test_ms'] = round(float(fields[1]) * 1000, 1)
+                    result['test_error'] = None
+                elif code:
+                    result['test_error'] = 'http_' + str(code)
+                elif p.returncode == 28:
+                    result['test_error'] = 'timeout'
+                elif p.returncode in (5, 6):
+                    result['test_error'] = 'dns'
+                elif p.returncode in (35, 51, 60):
+                    result['test_error'] = 'tls_error'
+                else:
+                    log.flush()
+                    detail = (directory / 'log').read_text(errors='replace').lower()
+                    if any(item in detail for item in ('dns: exchange failed', 'lookup ', 'resolve ', 'no such host')):
+                        result['test_error'] = 'dns'
+                    elif any(item in detail for item in ('i/o timeout', 'deadline exceeded')):
+                        result['test_error'] = 'timeout'
+                return result
+            except subprocess.TimeoutExpired:
+                result['test_error'] = 'timeout'
+                return result
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait()
+
+
+def latency(ids, job=None, progress=None):
+    nodes = load_nodes()
+    if isinstance(ids, str):
+        ids = json.loads(ids)
+    overrides = {}
+    if isinstance(ids, dict):
+        overrides = {k: str(v) for k, v in ids.get('options', {}).items()
+                     if k in ('probe_method', 'probe_url_preset', 'probe_custom_url', 'probe_timeout', 'probe_dns')}
+        ids = ids.get('ids', [])
+    if not isinstance(ids, list) or len(ids) > 256:
+        raise ValueError('Probe at most 256 node IDs per request')
+    index = {n['id']: n for n in nodes}
+    selected = [index[ident] for ident in dict.fromkeys(ids) if ident in index]
+    s = settings()
+    s.update(overrides)
+    method, url, timeout = probe_options(s)
+    measurements = {}
+    resolution, resolution_lock = {}, Lock()
+    def resolve_cached(server):
+        with resolution_lock:
+            owner = server not in resolution
+            if owner: resolution[server] = Future()
+            future = resolution[server]
+        if owner:
+            try: future.set_result(probe_resolve(server, s.get('probe_dns', 'default'), s['uplink']))
+            except Exception: future.set_result([])
+        return list(future.result())
+    def measure(node):
+        if job and (RUN / 'probe-jobs' / (job + '.cancel')).exists():
+            return None
+        if method == 'url_test':
+            return probe_url(node, s, url, timeout, job=job)
+        target = (node['outbound']['server'], node['outbound']['server_port'])
+        measurement = dict(probe_server(target, tcp_only=method == 'tcp_connect',
+            dns=s.get('probe_dns', 'default'), uplink=s['uplink'], timeout=timeout,
+            addresses=resolve_cached(target[0])), method=method)
+        measurement['test_ms'], measurement['test_error'] = measurement['tcp_ms'], measurement.get('tcp_error')
+        return measurement
+    workers = 2 if method == 'url_test' else 6
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(measure, node): node['id'] for node in selected}
+        for future in as_completed(futures):
+            try:
+                measurement = future.result()
+            except Exception:
+                # A malformed or transiently failing node must not discard
+                # successful measurements from the rest of the subscription.
+                measurement = dict(method=method, timestamp=int(time.time()),
+                    icmp_ms=None, tcp_ms=None, test_ms=None,
+                    icmp_error='probe_error', tcp_error='probe_error', test_error='probe_error')
+            if measurement is None: continue
+            measurements[futures[future]] = measurement
+            if progress:
+                progress(dict(ok=True, state='running', completed=len(measurements), total=len(selected), latency=dict(measurements)))
+    if job and (RUN / 'probe-jobs' / (job + '.cancel')).exists():
+        return dict(ok=True, state='cancelled', latency={})
+    p = RUN / 'latency.json'
+    cached = json.loads(p.read_text()) if p.exists() else {}
+    for node in selected:
+        cached[node['id']] = measurements[node['id']]
+    cached = {n['id']: cached[n['id']] for n in nodes if n['id'] in cached}
+    atomic(p, cached)
+    return dict(ok=True, completed=len(selected), total=len(selected), latency={n['id']: cached[n['id']] for n in selected})
+
+
+def probe_job(action, value):
+    folder = RUN / 'probe-jobs'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    if action == 'probe_start':
+        payload = json.loads(value)
+        ids = payload.get('ids', []) if isinstance(payload, dict) else payload
+        if not isinstance(ids, list) or len(ids) > 256:
+            raise ValueError('Probe at most 256 node IDs per job')
+        for old in list(folder.glob('*.json')) + list(folder.glob('*.cancel')):
+            if time.time() - old.stat().st_mtime > 3600:
+                old.unlink(missing_ok=True)
+        ident = uuid.uuid4().hex
+        atomic(folder / (ident + '-request.json'), payload)
+        atomic(folder / (ident + '.json'), dict(ok=True, state='running'))
+        process = subprocess.Popen([sys.executable, __file__, 'probe-worker', ident],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        atomic(folder / (ident + '-process.json'), dict(pid=process.pid))
+        return dict(ok=True, job=ident)
+    if not re.fullmatch('[a-f0-9]{32}', value):
+        raise ValueError('Invalid probe job ID')
+    path = folder / (value + '.json')
+    if not path.exists():
+        raise ValueError('Probe job expired; run the test again')
+    if action == 'probe_cancel':
+        atomic(folder / (value + '.cancel'), dict(cancelled=True))
+        metadata = folder / (value + '-process.json')
+        if metadata.exists():
+            pid = json.loads(metadata.read_text()).get('pid')
+            try:
+                # Only terminate this detached probe group, never a managed production core.
+                argv = Path('/proc/' + str(pid) + '/cmdline').read_bytes().split(b'\0')
+                if type(pid) is int and pid > 1 and b'probe-worker' in argv and value.encode() in argv and os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGTERM)
+                    # Wait briefly for the worker to stop creating temporary
+                    # directories before removing them. Zombies cannot run.
+                    for _ in range(50):
+                        stat = Path('/proc/' + str(pid) + '/stat').read_text()
+                        if stat.rsplit(')', 1)[1].split()[0] == 'Z':
+                            break
+                        time.sleep(.01)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        response = dict(ok=True, state='cancelled', latency={})
+        atomic(path, response)
+        (folder / (value + '-request.json')).unlink(missing_ok=True)
+        for directory in RUN.glob('probe-' + value + '-url-*'):
+            if directory.is_dir():
+                shutil.rmtree(directory, ignore_errors=True)
+        return response
+    if (folder / (value + '.cancel')).exists():
+        return dict(ok=True, state='cancelled', latency={})
+    return json.loads(path.read_text())
+
+
+def probe_worker(ident):
+    if not re.fullmatch('[a-f0-9]{32}', ident):
+        return
+    folder = RUN / 'probe-jobs'
+    request = folder / (ident + '-request.json')
+    try:
+        payload = json.loads(request.read_text())
+        # Serialize workers with each other, without blocking RPC polling or
+        # ordinary LuCI actions on the main backend lock.
+        with open(folder / 'worker.lock', 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if (folder / (ident + '.cancel')).exists():
+                response = dict(ok=True, state='cancelled', latency={})
+            else:
+                response = latency(payload, job=ident, progress=lambda state: atomic(folder / (ident + '.json'), state))
+        response.setdefault('state', 'done')
+    except Exception as error:
+        response = dict(ok=False, state='done', error=str(error))
+    finally:
+        request.unlink(missing_ok=True)
+    atomic(folder / (ident + '.json'), response)
+
+
+def wait_service(device):
+    for _ in range(100):
+        state = json.loads(run('ubus', 'call', 'service', 'list', '{"name":"singbox-gui"}'))
+        running = any(item.get('running') for item in state.get('singbox-gui', {}).get('instances', {}).values())
+        if running and Path('/sys/class/net/' + device).exists():
+            return
+        time.sleep(.15)
+    raise ValueError('TUN did not appear; check logread -e sing-box')
+
+
+def apply():
+    # Never race other pending LuCI edits into a network reload.
+    for name in managed_configs():
+        if run('uci', 'changes', name):
+            raise ValueError('Apply or discard pending changes in ' + name + ' first')
+    s = settings()
+    if s['enabled'] != '1':
+        run('/etc/init.d/singbox-gui', 'stop')
+        run('/etc/init.d/singbox-gui', 'disable')
+        return dict(ok=True, message='Service stopped; existing PBR policies are preserved')
+    # A separate upstream instance must not compete with our TUN service.
+    service = json.loads(run('ubus', 'call', 'service', 'list', '{"name":"sing-box"}'))
+    if any(i.get('running') for i in service.get('sing-box', {}).get('instances', {}).values()):
+        raise ValueError('The separate sing-box service is running; stop it before using this GUI')
+    state = json.loads(run('ubus', 'call', 'service', 'list', '{"name":"singbox-gui"}'))
+    was_running = any(i.get('running') for i in state.get('singbox-gui', {}).get('instances', {}).values())
+    runtime = RUN / 'config.json'
+    old_runtime = runtime.read_bytes() if runtime.exists() else None
+    backup = STORE / ('backup-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6])
+    backup.mkdir(mode=0o700)
+    owned = STORE / 'interface.json'
+    old_owned = owned.read_bytes() if owned.exists() else None
+    for name in managed_configs():
+        if Path('/etc/config/' + name).exists():
+            (backup / name).write_bytes(Path('/etc/config/' + name).read_bytes())
+    restart_attempted = False
+    try:
+        s = generate()
+        configure_network(s)
+        run('/etc/init.d/singbox-gui', 'enable')
+        restart_attempted = True
+        run('/etc/init.d/singbox-gui', 'restart')
+        wait_service(s['device'])
+        # Reload netifd without restarting WAN, then bring up only our interface.
+        run('ubus', 'call', 'network', 'reload', '{}')
+        run('/sbin/ifup', s['interface'])
+        run('/etc/init.d/firewall', 'reload')
+        reload_pbr()
+    except Exception:
+        if restart_attempted:
+            run('/etc/init.d/singbox-gui', 'stop', check=False)
+        for name in managed_configs():
+            run('uci', 'revert', name, check=False)
+            if (backup / name).exists():
+                Path('/etc/config/' + name).write_bytes((backup / name).read_bytes())
+        if old_owned is None:
+            owned.unlink(missing_ok=True)
+        else:
+            owned.write_bytes(old_owned)
+        run('ubus', 'call', 'network', 'reload', '{}', check=False)
+        run('/etc/init.d/firewall', 'reload', check=False)
+        if old_runtime is None:
+            runtime.unlink(missing_ok=True)
+        else:
+            runtime.write_bytes(old_runtime)
+        if restart_attempted and was_running and old_runtime is not None:
+            previous = json.loads(old_runtime)
+            recovery = RUN / 'recovery.json'
+            atomic(recovery, previous)
+            try:
+                run('/etc/init.d/singbox-gui', 'restart')
+                device = next(i['interface_name'] for i in previous['inbounds'] if i.get('type') == 'tun')
+                wait_service(device)
+                previous_iface = json.loads(old_owned)['interface'] if old_owned else s['interface']
+                run('/sbin/ifup', previous_iface, check=False)
+            finally:
+                recovery.unlink(missing_ok=True)
+        reload_pbr()
+        raise
+    message = ('Applied. PBR is reloading in the background. Select ' + s['interface'] + ' in PBR policies.'
+               if routing_load().get('capture_mode') != 'automatic' else 'Routing profile saved and applied')
+    return dict(ok=True, message=message, backup=str(backup))
+
+
+def dispatch(method, args):
+    if method in ('routing_get', 'routing_start', 'routing_poll'):
+        return routing_job(method, args)
+    if method == 'set_language':
+        language = args.get('language', '')
+        if language not in ('ru', 'en'):
+            raise ValueError('Unsupported package language')
+        run('uci', 'set', 'singbox_gui.main.ui_language=' + language)
+        run('uci', 'commit', 'singbox_gui')
+        return dict(ok=True)
+    if method == 'interfaces':
+        data = json.loads(run('ubus', 'call', 'network.interface', 'dump'))
+        own_name = uci('singbox_gui.main.interface', 'sb0')
+        own_device = uci('singbox_gui.main.device', 'sb-tun0')
+        grouped = {}
+        for item in data.get('interface', []):
+            name = item.get('interface', '')
+            device = item.get('l3_device') or item.get('device')
+            if name in ('loopback', own_name) or not device or device in ('lo', own_device):
+                continue
+            if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,14}', device):
+                continue
+            entry = grouped.setdefault(device, dict(device=device, names=[], up=False, default_route=False))
+            entry['names'].append(name)
+            entry['up'] = entry['up'] or bool(item.get('up'))
+            entry['default_route'] = entry['default_route'] or any(r.get('target') == '0.0.0.0' and r.get('mask') == 0 for r in item.get('route', []))
+        return dict(ok=True, interfaces=sorted(grouped.values(), key=lambda item: (not item['default_route'], not item['up'], item['device'])))
+    if method in ('subscriptions', 'subscription_save', 'subscription_refresh', 'subscription_reregister', 'subscription_delete'):
+        return subscription_action(method, args)
+    if method == 'logs':
+        text = run('logread', check=False)
+        text = '\n'.join(line for line in text.splitlines()
+                         if re.search(r'\b(?:singbox-gui(?:-core)?|sing-box)(?:\[|:|\s)', line))
+        text = '\n'.join(text.splitlines()[-160:])
+        text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+        text = re.sub(r'\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b', '[UUID]', text)
+        return dict(ok=True, text=text or 'Записей Sing-box пока нет.')
+    if method == 'nodes':
+        p = RUN / 'latency.json'
+        cached = json.loads(p.read_text()) if p.exists() else {}
+        sources = load_subscriptions()
+        return dict(default_id=next((s['id'] for s in sources if s.get('default')), sources[0]['id'] if sources else ''),
+                    subscriptions=[dict(id=s['id'], name=s['name'], count=len(s.get('nodes', []))) for s in sources],
+                    nodes=[dict(id=n['id'], name=n['name'], subscription_ids=n.get('subscription_ids', []), server=n['outbound']['server'], port=n['outbound']['server_port'], latency=cached.get(n['id'])) for n in load_nodes()])
+    if method == 'status':
+        data = json.loads(run('ubus', 'call', 'service', 'list', '{"name":"singbox-gui"}'))
+        instances = data.get('singbox-gui', {}).get('instances', {})
+        s = settings()
+        ver = core_version()
+        return dict(version='sing-box version ' + ver, core_version=ver, user_agent='sing-box/' + ver,
+                    running=any(i.get('running') for i in instances.values()),
+                    interface=s['interface'], device=s['device'],
+                    interface_created=uci('network.' + s['interface']) == 'interface',
+                    firewall_ready=uci('firewall.singbox_gui.singbox_gui') == '1' and s['interface'] in uci('firewall.singbox_gui.network').split() and uci('firewall.singbox_gui_lan.src') == s['source_zone'],
+                    device_up=Path('/sys/class/net/' + s['device']).exists(), nodes=len(load_nodes()))
+    if method == 'import':
+        sources = load_subscriptions()
+        source_id = args.get('subscription_id') or 'primary'
+        source = next((s for s in sources if s['id'] == source_id), None)
+        text = args.get('text', '').strip()
+        if not text:
+            if source_id == 'manual':
+                raise ValueError('Вставьте VLESS-ссылки или base64-список для импорта.')
+            s = settings()
+            text = fetch_subscription(source['url'] if source else s['subscription'], source_settings(source) if source else s)
+        if len(text.encode()) > LIMIT:
+            raise ValueError('Subscription exceeds 2 MiB')
+        nodes, errors = parse_subscription(text)
+        if source is None:
+            source = dict(id=source_id, name='Импортированные ссылки', url='')
+            sources.append(source)
+        other_ids = {n['id'] for item in sources if item['id'] != source_id for n in item.get('nodes', [])}
+        if routing.references(routing_load()) & {n['id'] for n in source.get('nodes', [])} - {n['id'] for n in nodes} - other_ids:
+            raise ValueError('The update removes a server used by routing rules. Update the routing profile first')
+        source.update(nodes=nodes, updated_at=int(time.time()))
+        atomic(STORE / 'subscriptions.json', sources)
+        return dict(ok=True, count=len(nodes), warnings=errors[:30])
+    if method == 'apply':
+        return apply()
+    if method == 'restart':
+        if settings().get('enabled') != '1':
+            raise ValueError('Сначала включите Sing-box и нажмите «Сохранить и применить».')
+        generate()
+        run('/etc/init.d/singbox-gui', 'restart')
+        return dict(ok=True, message='Sing-box перезапущен.')
+    if method == 'stop':
+        run('/etc/init.d/singbox-gui', 'stop')
+        run('/etc/init.d/singbox-gui', 'disable')
+        run('uci', 'set', 'singbox_gui.main.enabled=0')
+        run('uci', 'commit', 'singbox_gui')
+        return dict(ok=True)
+    if method == 'hwid':
+        return dict(hwid=str(uuid.uuid4()))
+    if method == 'latency':
+        return latency(args.get('ids', []))
+    if method in ('config_get', 'config_save', 'config_auto'):
+        return config_editor(method, args.get('text', ''))
+    if method in ('probe_start', 'probe_poll', 'probe_cancel'):
+        return probe_job(method, args.get('ids' if method == 'probe_start' else 'job', ''))
+    if method in ('create_interface', 'create_firewall'):
+        return create_interface(method == 'create_firewall')
+    raise ValueError('Unknown method')
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'refresh-due':
+        for _ in range(20):
+            if not refresh_due():
+                break
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == 'install-schedule':
+        install_schedule()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == 'list':
+        print(json.dumps({'routing_get': {}, 'routing_start': {'text': 'String', 'mode': 'String'}, 'routing_poll': {'job': 'String'}, 'set_language': {'language': 'String'}, 'status': {}, 'nodes': {}, 'interfaces': {}, 'logs': {}, 'import': {'text': 'String', 'subscription_id': 'String'}, 'subscriptions': {}, 'subscription_save': {'id': 'String', 'name': 'String', 'url': 'String', 'update_interval': 'String', 'default': 'String'}, 'subscription_refresh': {'id': 'String'}, 'subscription_reregister': {'id': 'String'}, 'subscription_delete': {'id': 'String'}, 'apply': {}, 'stop': {}, 'restart': {}, 'hwid': {}, 'latency': {'ids': 'String'}, 'probe_start': {'ids': 'String'}, 'probe_poll': {'job': 'String'}, 'probe_cancel': {'job': 'String'}, 'config_get': {}, 'config_save': {'text': 'String'}, 'config_auto': {}, 'create_interface': {}, 'create_firewall': {}}))
+        return
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if len(sys.argv) > 2 and sys.argv[1] == 'routing-worker':
+        routing_worker(sys.argv[2])
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == 'probe-worker':
+        probe_worker(sys.argv[2])
+        return
+    method = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == 'call' else ''
+    if method in ('probe_poll', 'probe_cancel', 'status', 'nodes', 'logs', 'subscriptions', 'interfaces', 'routing_get', 'routing_poll'):
+        raw = sys.stdin.buffer.read(LIMIT + 1)
+        if len(raw) > LIMIT:
+            raise ValueError('RPC request too large')
+        print(json.dumps(dispatch(method, json.loads(raw or b'{}'))))
+        return
+    generating = len(sys.argv) > 1 and sys.argv[1] == 'generate'
+    with open(RUN / ('generate.lock' if generating else 'lock'), 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if len(sys.argv) > 1 and sys.argv[1] == 'generate':
+            generate()
+            return
+        method = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == 'call' else ''
+        raw = sys.stdin.buffer.read(LIMIT + 1)
+        if len(raw) > LIMIT:
+            raise ValueError('RPC request too large')
+        args = json.loads(raw or b'{}')
+        print(json.dumps(dispatch(method, args), ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        if len(sys.argv) > 1 and sys.argv[1] == 'generate':
+            print(str(error), file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(dict(ok=False, error=str(error))))

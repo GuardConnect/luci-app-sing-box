@@ -1,0 +1,40 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+let calls=[], errors=[];
+const map={section:()=>({option:()=>({value(){},depends(){}})}),render:async()=>({}),save:async()=>{}};
+const rpc={declare(s){return async(...args)=>{calls.push([s.method,args]);return s.method==='config_get'?{ok:true,text:'{"log":{"level":"info"}}',manual:false}:{ok:true,message:'Applied'};}}};
+function E(tag,attrs,children){return {tag,attrs:attrs||{},children:children||[],replaceChildren(...v){this.children=v;},style:{display:attrs?.style?.includes('display:none')?'none':''}};}
+const ctx={E,rpc,view:{extend:x=>x},form:{Map:function(){return map;}},uci:{get:()=>''},ui:{changes:{init:async()=>{}},addNotification(a,b){errors.push(b);}},L:{url:()=>''}};
+ctx.choices={label:function(name){return E('span',{},name);}};
+ctx.baseclass=ctx.view;
+ctx.i18n={tr:x=>x,setLanguage(){},locale:()=> 'ru-RU'};
+const view=vm.runInNewContext('(function(){'+fs.readFileSync('luci-app-sing-box/htdocs/luci-static/resources/singbox-ui.js','utf8')+'})()',ctx);
+view.tab='all';
+function find(n,p){if(!n||typeof n!=='object')return; if(p(n))return n;for(const c of [].concat(n.children||[])){const r=find(c,p);if(r)return r;}}
+(async()=>{
+ const page=await view.render([{}, {nodes:[]}, {}]);
+ const button=label=>find(page,n=>n.tag==='button'&&n.children===label);
+ const raw=find(page,n=>n.tag==='textarea'&&n.attrs['aria-label']);
+ await button('Отобразить текущий конфиг для редактирования').attrs.click();
+ assert.equal(raw.value,'{"log":{"level":"info"}}');
+ const toggle=button('Отобразить текущий конфиг для редактирования');
+ const editor=find(page,n=>Array.isArray(n.children)&&n.children.includes(raw));
+ raw.value='{"log":{"level":"debug"}}';
+ await toggle.attrs.click();assert.equal(editor.style.display,'none');
+ await toggle.attrs.click();assert.equal(editor.style.display,'');
+ assert.equal(raw.value,'{"log":{"level":"debug"}}');
+ assert.equal(calls.filter(c=>c[0]==='config_get').length,1);
+ const section=find(page,n=>n.attrs?.class==='cbi-section'&&Array.isArray(n.children)&&n.children.some(c=>c.tag==='h3'&&c.children==='Ручное редактирование конфигурации Sing-box'));
+ const actions=find(page,n=>n.attrs?.class==='cbi-page-actions');
+ assert(page.children.indexOf(section)>=0);
+ assert(page.children.indexOf(section)<page.children.indexOf(actions));
+ const field=find(section,n=>n.attrs?.class==='cbi-value-field');assert(field.children.includes(toggle));
+ raw.value='bad JSON'; calls=[];
+ await button('Сохранить и применить вручную').attrs.click();
+ assert.equal(calls.length,0);assert.equal(errors.length,1);
+ raw.value='{"log":{"level":"warn"}}';
+ await button('Сохранить и применить вручную').attrs.click();
+ assert.equal(calls[0][0],'config_save');assert.equal(calls[0][1][0],raw.value);
+ calls=[];await button('Вернуть конфигурацию из GUI').attrs.click();
+ assert.deepStrictEqual(calls.map(c=>c[0]),['commit','config_auto','config_get']);
+ console.log('PASS: editor load, reject invalid JSON, save edited text, return to GUI');
+})().catch(e=>{console.error(e);process.exit(1)});

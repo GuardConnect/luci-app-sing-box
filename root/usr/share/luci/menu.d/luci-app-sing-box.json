@@ -1,0 +1,123 @@
+{
+  "admin/services/sing-box": {
+    "title": "Sing-Box",
+    "order": 60,
+    "action": {
+      "type": "view",
+      "path": "sing-box/settings"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/settings": {
+    "order": 5,
+    "action": {
+      "type": "view",
+      "path": "sing-box/settings"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/subscription": {
+    "order": 10,
+    "action": {
+      "type": "view",
+      "path": "sing-box/overview"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/servers": {
+    "order": 20,
+    "action": {
+      "type": "view",
+      "path": "sing-box/servers"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/dns": {
+    "order": 30,
+    "action": {
+      "type": "view",
+      "path": "sing-box/dns"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/network": {
+    "order": 40,
+    "action": {
+      "type": "view",
+      "path": "sing-box/network"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/versions": {
+    "order": 50,
+    "action": {
+      "type": "view",
+      "path": "sing-box/versions"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/config": {
+    "order": 60,
+    "action": {
+      "type": "view",
+      "path": "sing-box/config"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/logs": {
+    "order": 70,
+    "action": {
+      "type": "view",
+      "path": "sing-box/logs"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  },
+  "admin/services/sing-box/routing": {
+    "order": 25,
+    "action": {
+      "type": "view",
+      "path": "sing-box/routing"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-sing-box"
+      ]
+    }
+  }
+}

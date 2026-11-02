@@ -1,0 +1,6 @@
+artifacts/
+__pycache__/
+*.pyc
+.env
+.tools/
+docs/screenshots/profile/

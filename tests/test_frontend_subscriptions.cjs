@@ -1,0 +1,54 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const options={},calls=[];let refreshedSources=null;
+function E(tag,attrs,children){return {tag,attrs:attrs||{},children:children||[],replaceChildren(...v){this.children=v;},value:attrs?.value||'',style:{display:attrs?.style?.includes('display:none')?'none':''},removeAttribute(){},focus(){calls.push('focus');},select(){calls.push('select');}};}
+const map={section:()=>({option(type,name){const o={choices:[],value(k,v){this.choices.push([k,v]);},depends(){},renderWidget(){return E('input',{});}};options[name]=o;return o;}}),render:async()=>({})};
+const context={E,baseclass:{extend:x=>x},form:{Map:function(){return map;}},rpc:{declare:s=>async(...args)=>{calls.push([s.method,args]);return s.method==='subscriptions' && refreshedSources ? refreshedSources : {ok:true};}},uci:{get:()=> 'a'},ui:{addNotification(){calls.push('notification');}},L:{url:(...p)=>'/'+p.join('/')},window:{location:{},isSecureContext:false},document:{execCommand(cmd){calls.push(cmd);return true;}}};
+context.choices={label:name=>E('span',{},name)};
+let modal;
+context.ui.showModal=(title,body)=>{modal=E('div',{},body);};context.ui.hideModal=()=>{};
+context.i18n={tr:x=>x,setLanguage(){},locale:()=> 'ru-RU'};
+const view=vm.runInNewContext('(function(){'+fs.readFileSync('luci-app-sing-box/htdocs/luci-static/resources/singbox-ui.js','utf8')+'})()',context);
+function find(n,p){if(!n||typeof n!=='object')return;if(p(n))return n;for(const c of [].concat(n.children||[])){const r=find(c,p);if(r)return r;}}
+function text(n){if(typeof n==='string')return n;if(!n||typeof n!=='object')return '';return [].concat(n.children||[]).map(text).join(' ');}
+(async()=>{
+ view.tab='all';view.subscription='';
+ const sources=[{id:'one',name:'First',count:1,url:'https://one.example/sub'},{id:'two',name:'Second',count:1,url:'https://two.example/sub'}];
+ const nodes=[{id:'a',name:'First node',subscription_ids:['one'],server:'192.0.2.1',port:443},{id:'b',name:'Second node',subscription_ids:['two'],server:'192.0.2.2',port:8443}];
+ const page=await view.render([{}, {nodes,subscriptions:sources,default_id:'two'}, {}, {}, {text:'actual log'}, {subscriptions:sources}]);
+ const switcher=options._subscription.renderWidget();
+ assert.equal(switcher.children.length,2);assert(switcher.children[1].attrs.selected);
+ switcher.attrs.change.call({value:'one'});assert(context.window.location.href.endsWith('?subscription=one'));
+ const table=options._latency.renderWidget();
+ assert(find(table,n=>n.tag==='div'&&n.attrs.class==='sb-probe-toolbar'));
+ assert(text(table).includes('Second node'));assert(!text(table).includes('First node'));
+ const manager=find(page,n=>n.attrs?.['aria-label']==='Сохранённые подписки');
+ assert.equal(manager.children.length,2);
+ assert(find(page,n=>n.attrs?.['aria-label']==='Добавить URL подписки'));
+ assert(find(page,n=>n.attrs?.['aria-label']==='Интервал обновления, минут'));
+ assert(find(page,n=>n.tag==='button'&&n.children==='Редактировать'));
+ const reregister=find(page,n=>n.tag==='button'&&n.children==='Перерегистрировать подписку с новым HWID');
+ assert.equal(reregister.attrs.disabled,null,'enabled button must omit the HTML disabled attribute');
+ assert.equal(switcher.children[0].attrs.selected,null,'unselected option must omit the HTML selected attribute');
+ reregister.attrs.click();assert(modal);
+ assert(!calls.some(c=>Array.isArray(c)&&c[0]==='subscription_reregister'),'must wait for confirmation');
+ const editing=find(page,n=>n.attrs?.class==='sb-source-edit');
+ find(page,n=>n.tag==='button'&&n.children==='Редактировать').attrs.click();
+ assert.equal(editing.style.display,'');
+ find(page,n=>n.attrs?.['aria-label']==='Интервал обновления, минут').value='180';
+ const destination=find(page,n=>n.attrs?.['aria-label']==='Подписка для импорта');assert.equal(destination.value,'manual','Import must default to the separate manual group');
+ destination.value='two';
+ refreshedSources={ok:true,subscriptions:sources.concat({id:'three',name:'Third',url:'https://three.example/sub'}),default_id:'one'};
+ const save=find(page,n=>n.tag==='button'&&n.children==='Сохранить изменения');
+ await save.attrs.click.call(save);
+ assert(calls.some(c=>Array.isArray(c)&&c[0]==='subscription_save'&&c[1][3]==='180'));
+ assert(destination.children.some(n=>n.attrs.value==='three'),'New source must appear in import destinations');assert.equal(destination.value,'two');
+ const copy=find(page,n=>n.tag==='button'&&n.children==='Скопировать журнал');
+ await copy.attrs.click.call(copy);
+ assert(calls.includes('copy'));assert(calls.includes('notification'));assert.equal(copy.disabled,false);
+ const confirm=find(modal,n=>n.tag==='button'&&n.children==='Перерегистрировать');
+ refreshedSources={ok:true,subscriptions:sources.filter(source=>source.id!=='two'),default_id:'one'};
+ await confirm.attrs.click.call(confirm);
+ assert(!destination.children.some(n=>n.attrs.value==='two'),'Removed source must leave import destinations');assert.equal(destination.value,'manual');
+ assert(calls.some(c=>Array.isArray(c)&&c[0]==='subscription_reregister'&&c[1][0]==='one'));
+ console.log('PASS: compact subscription manager, interval editor, switcher, filtered choices and HTTP clipboard fallback');
+})().catch(e=>{console.error(e);process.exit(1)});

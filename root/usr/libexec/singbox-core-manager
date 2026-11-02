@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+"""Official stable core releases; isolated managed copy, asynchronous operations."""
+import fcntl, hashlib, json, os, platform, re, shutil, subprocess, sys, tarfile, tempfile, time, uuid
+from pathlib import Path
+
+STORE=Path('/etc/singbox-gui'); CORE=STORE/'core'; RUN=Path('/var/run/singbox-gui'); META=STORE/'core-updates.json'
+def atomic(path,data):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    fd,name=tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd,'w') as f:json.dump(data,f,ensure_ascii=False)
+        os.replace(name,path)
+    finally:
+        if os.path.exists(name):os.unlink(name)
+def read(path):return json.loads(path.read_text()) if path.exists() else {}
+def command(*args,timeout=15):
+    p=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
+    if p.returncode:raise ValueError(p.stderr[-1200:] or 'Command failed: '+args[0])
+    return p.stdout.strip()
+def version(path):
+    try:
+        m=re.search(r'sing-box version (\S+)',command(str(path),'version'))
+        return m.group(1) if m else 'unknown'
+    except Exception:return 'unknown'
+def active():return CORE/'sing-box' if os.access(CORE/'sing-box',os.X_OK) else Path('/usr/bin/sing-box')
+def status():
+    meta=read(META); actual=version(active()); system=version('/usr/bin/sing-box')
+    return dict(ok=True,current=actual,system=system,managed=active()==CORE/'sing-box',
+        architecture=platform.machine(),supported=platform.machine()=='x86_64',
+        user_agent='sing-box/'+actual,job=read(RUN/'core-job.json'),**meta)
+def download(url,path,limit):
+    if not url.startswith(('https://api.github.com/repos/SagerNet/sing-box/releases','https://github.com/SagerNet/sing-box/releases/download/')):
+        raise ValueError('Only official SagerNet release URLs are allowed')
+    seconds=20 if url.startswith('https://api.github.com/') else 180
+    p=subprocess.run(['curl','--fail','--silent','--show-error','--location','--proto','=https','--proto-redir','=https',
+        '--max-time',str(seconds),'--max-filesize',str(limit),'-H','Accept: application/vnd.github+json',
+        '-H','User-Agent: luci-app-sing-box','--output',str(path),'--',url],capture_output=True,text=True,timeout=seconds+5)
+    if p.returncode:
+        reason={6:'Не удалось разрешить адрес GitHub через DNS.',28:'GitHub не ответил за отведённое время.',63:'Ответ GitHub превышает разрешённый размер.',22:'GitHub вернул ошибку HTTP; возможен лимит API.'}.get(p.returncode,'Ошибка соединения с GitHub.')
+        raise ValueError(reason+' (curl '+str(p.returncode)+')')
+    if path.stat().st_size>limit:raise ValueError('Downloaded file is too large')
+def get_json(url,folder):
+    path=folder/'metadata.json';download(url,path,32*1024*1024);return read(path)
+def releases(folder):
+    latest=get_json('https://api.github.com/repos/SagerNet/sing-box/releases/latest',folder)
+    data=get_json('https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30',folder)
+    if not isinstance(data,list):raise ValueError('Invalid GitHub release list')
+    if isinstance(latest,dict):data.insert(0,latest)
+    result=[]
+    seen=set()
+    for r in data:
+        tag=r.get('tag_name','')
+        if r.get('draft') or r.get('prerelease') or not re.fullmatch(r'v\d+\.\d+\.\d+',tag):continue
+        if tag in seen:continue
+        if not any(a.get('name')=='sing-box-'+tag[1:]+'-linux-amd64-musl.tar.gz' for a in r.get('assets',[])):continue
+        result.append(dict(version=tag[1:],published=r.get('published_at',''),url=r.get('html_url','')))
+        seen.add(tag)
+    if not result:raise ValueError('No stable releases found')
+    result.sort(key=lambda r:tuple(map(int,r['version'].split('.'))),reverse=True)
+    meta=read(META);meta.update(last_checked=int(time.time()),latest=result[0]['version'],versions=result,last_error='')
+    atomic(META,meta);return meta
+def restart_if_running(was_running):
+    if not was_running:return
+    command('/etc/init.d/singbox-gui','restart',timeout=25)
+    for _ in range(25):
+        time.sleep(.2)
+        data=json.loads(command('ubus','call','service','list','{"name":"singbox-gui"}'))
+        instances=data.get('singbox-gui',{}).get('instances',{})
+        cfg=read(RUN/'config.json')
+        devices=[item.get('interface_name') for item in cfg.get('inbounds',[]) if item.get('type')=='tun']
+        if any(i.get('running') for i in instances.values()) and all(Path('/sys/class/net/'+name).exists() for name in devices if name):return
+    raise ValueError('Service did not start after core change')
+def restart_runtime(running,runtime):
+    recovery=RUN/'recovery.json'
+    if running and runtime is not None:atomic(recovery,json.loads(runtime))
+    try:restart_if_running(running)
+    finally:recovery.unlink(missing_ok=True)
+
+def switch(candidate,target_version=None):
+    # Core changes and GUI apply must never replace/restart the runtime concurrently.
+    with open(RUN/'lock','w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        return _switch(candidate,target_version)
+
+def _switch(candidate,target_version=None):
+    CORE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    current=CORE/'sing-box'; previous=CORE/'sing-box.previous'; had=current.exists()
+    cfg=RUN/'config.json'
+    runtime=cfg.read_bytes() if cfg.exists() else None
+    if cfg.exists():command(str(candidate or '/usr/bin/sing-box'),'check','-c',str(cfg))
+    state=json.loads(command('ubus','call','service','list','{"name":"singbox-gui"}'))
+    running=any(i.get('running') for i in state.get('singbox-gui',{}).get('instances',{}).values())
+    if had:shutil.copy2(current,previous)
+    try:
+        if candidate:
+            stage=CORE/'sing-box.new';shutil.copyfile(candidate,stage);stage.chmod(0o755);os.replace(stage,current)
+        else:current.unlink(missing_ok=True)
+        restart_runtime(running,runtime)
+    except Exception:
+        if had:os.replace(previous,current)
+        else:current.unlink(missing_ok=True)
+        restart_runtime(running,runtime)
+        raise
+    meta=read(META);meta.update(installed_at=int(time.time()),installed_version=target_version or version('/usr/bin/sing-box'),last_error='')
+    atomic(META,meta)
+def install(ver,folder):
+    if platform.machine()!='x86_64':raise ValueError('Managed core installation currently supports x86_64 only')
+    if not re.fullmatch(r'\d+\.\d+\.\d+',ver):raise ValueError('Choose a stable version')
+    r=get_json('https://api.github.com/repos/SagerNet/sing-box/releases/tags/v'+ver,folder)
+    if r.get('draft') or r.get('prerelease') or r.get('tag_name')!='v'+ver:raise ValueError('Not an official stable release')
+    name='sing-box-'+ver+'-linux-amd64-musl.tar.gz'
+    asset=next((a for a in r.get('assets',[]) if a.get('name')==name),None)
+    if not asset:raise ValueError('No compatible musl archive in this release')
+    digest=asset.get('digest','')
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}',digest):raise ValueError('Official release has no SHA-256 digest; installation refused')
+    job=read(RUN/'core-job.json');job['message']='Загрузка и проверка SHA-256 версии '+ver;atomic(RUN/'core-job.json',job)
+    archive=folder/'core.tar.gz';download(asset['browser_download_url'],archive,160*1024*1024)
+    if hashlib.sha256(archive.read_bytes()).hexdigest()!=digest[7:]:raise ValueError('SHA-256 mismatch')
+    candidate=folder/'sing-box'
+    with tarfile.open(archive,'r:gz') as tar:
+        member=next((m for m in tar.getmembers() if m.name.endswith('/sing-box') and m.isfile()),None)
+        if not member or member.size>200*1024*1024:raise ValueError('Invalid binary in archive')
+        with tar.extractfile(member) as src,open(candidate,'wb') as dst:shutil.copyfileobj(src,dst)
+    candidate.chmod(0o755)
+    if version(candidate)!=ver:raise ValueError('Downloaded binary version mismatch')
+    switch(candidate,ver)
+def start(action,ver=''):
+    with open(RUN/'core-start.lock','w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        job=read(RUN/'core-job.json')
+        if job.get('state')=='running' and time.time()-job.get('started',0)<600:raise ValueError('Core operation already in progress')
+        ident=uuid.uuid4().hex
+        meta=read(META);meta.update(last_attempt=int(time.time()),last_operation=action);atomic(META,meta)
+        atomic(RUN/'core-job.json',dict(ok=True,state='running',started=int(time.time()),job=ident,message='Проверка релизов…' if action=='check' else 'Подготовка ядра…'))
+        subprocess.Popen([sys.executable,__file__,'worker',action,ver,ident],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        return dict(ok=True,job=ident)
+def worker(action,ver,ident):
+    with open(RUN/'core-worker.lock','w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        try:
+            with tempfile.TemporaryDirectory(prefix='core-update-',dir=str(RUN)) as temp:
+                if action=='check':releases(Path(temp))
+                elif action=='install':install(ver,Path(temp))
+                elif action=='restore':switch(None)
+                else:raise ValueError('Unknown core action')
+            response=dict(ok=True,state='done',job=ident,message='Проверка завершена.' if action=='check' else 'Ядро переключено.')
+        except Exception as error:
+            meta=read(META);meta.update(last_error=str(error),last_attempt=int(time.time()));atomic(META,meta)
+            response=dict(ok=False,state='done',job=ident,error=str(error))
+        atomic(RUN/'core-job.json',response)
+def main():
+    if len(sys.argv)>1 and sys.argv[1]=='list':
+        print(json.dumps(dict(status={},check={},install={'version':'String'},restore={},poll={})));return
+    RUN.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if len(sys.argv)>1 and sys.argv[1]=='worker':worker(*sys.argv[2:5]);return
+    method=sys.argv[2] if len(sys.argv)>2 else ''
+    args=json.loads(sys.stdin.read(4096) or '{}')
+    if method=='status':response=status()
+    elif method=='poll':response=read(RUN/'core-job.json')
+    elif method in ('check','install','restore'):response=start(method,args.get('version',''))
+    else:raise ValueError('Unknown method')
+    print(json.dumps(response,ensure_ascii=False))
+if __name__=='__main__':
+    try:main()
+    except Exception as error:print(json.dumps(dict(ok=False,error=str(error))))
