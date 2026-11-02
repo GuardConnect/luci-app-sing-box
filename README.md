@@ -22,12 +22,12 @@
 Проверено на **OpenWrt 25.12.6 x86/64** с **Sing-Box 1.14.4**. Для приложения нужно отдельно установленное ядро **Sing-Box 1.14.4 или новее**. Другие архитектуры пока не проверены на реальных устройствах.
 
 1. Сделайте резервную копию настроек роутера.
-2. Скачайте `luci-app-sing-box-0.1.0-r8.apk` из [релиза](https://github.com/GuardConnect/luci-app-sing-box/releases/latest) и скопируйте его в `/tmp` роутера.
+2. Скачайте `luci-app-sing-box-0.1.1-r1.apk` из [релиза](https://github.com/GuardConnect/luci-app-sing-box/releases/latest) и скопируйте его в `/tmp` роутера.
 3. Подключитесь к роутеру по SSH и выполните:
 
 ```sh
 apk update
-apk add --allow-untrusted /tmp/luci-app-sing-box-0.1.0-r8.apk
+apk add --allow-untrusted /tmp/luci-app-sing-box-0.1.1-r1.apk
 ```
 
 Параметр `--allow-untrusted` нужен, потому что пакет пока не подписан. Если установка сообщает об отсутствии подходящего Sing-Box, сначала установите совместимое ядро.
