@@ -168,6 +168,11 @@ class BackendTests(unittest.TestCase):
         cfg,_=b.routing.compile_profile(profile,base,[],S,Path('/tmp'))
         self.assertTrue(cfg['inbounds'][0]['auto_route']);self.assertTrue(cfg['inbounds'][0]['auto_redirect'])
         self.assertFalse(cfg['inbounds'][0]['strict_route'])
+        self.assertEqual(cfg['inbounds'][0]['dns_mode'],'hijack')
+        primary=dict(S,dns_mode='https_dns_proxy')
+        primary_cfg,_=b.routing.compile_profile(profile,b.config(primary,None,with_routing=False),[],primary,Path('/tmp'))
+        self.assertEqual(primary_cfg['inbounds'][0]['dns_mode'],'disabled')
+        self.assertEqual(primary_cfg['dns']['servers'][0]['server'],'127.0.0.1')
         self.assertTrue(all('routing_mark' not in n for n in cfg['outbounds']))
         self.assertIn('192.168.0.0/16',cfg['inbounds'][0]['route_exclude_address'])
         with tempfile.NamedTemporaryFile(mode='w',suffix='.json') as f:
