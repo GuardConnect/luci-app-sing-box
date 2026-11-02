@@ -24,6 +24,14 @@ S = dict(interface='sbvpn', device='sb-tun0', uplink='eth0', source_zone='lan',
 
 
 class BackendTests(unittest.TestCase):
+    def setUp(self):
+        # Never inherit the live router routing profile or subscription store.
+        store = tempfile.TemporaryDirectory()
+        self.addCleanup(store.cleanup)
+        isolated = patch.object(b, 'STORE', Path(store.name))
+        isolated.start()
+        self.addCleanup(isolated.stop)
+
     def test_primary_dns_ignores_unused_external_settings(self):
         cfg = b.config(dict(S, dns_mode='https_dns_proxy', dns='',
                             bootstrap_dns='invalid', dns_detour='invalid'), None, with_routing=False)
