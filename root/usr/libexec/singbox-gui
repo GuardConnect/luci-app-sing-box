@@ -632,8 +632,8 @@ def routing_worker(ident):
                             restart_attempted = True
                             run('/etc/init.d/singbox-gui', 'restart')
                             wait_service(active['device'])
-                            # ifup also triggers the package hotplug hook to refresh PBR's TUN table.
-                            run('/sbin/ifup', active['interface'])
+                            # ifup flushes addresses/routes installed by the core.
+                            reload_pbr()
                             applied = True
                     except Exception:
                         if old is None:
@@ -656,7 +656,7 @@ def routing_worker(ident):
                                     run('/etc/init.d/singbox-gui', 'restart')
                                     device = next(i['interface_name'] for i in previous['inbounds'] if i.get('type') == 'tun')
                                     wait_service(device)
-                                    run('/sbin/ifup', settings()['interface'], check=False)
+                                    reload_pbr()
                                 finally:
                                     recovery.unlink(missing_ok=True)
                         raise
@@ -1320,14 +1320,14 @@ def apply():
     try:
         s = generate()
         configure_network(s)
+        # netifd must finish before the core installs TUN addresses/routes.
+        run('ubus', 'call', 'network', 'reload', '{}')
+        run('/sbin/ifup', s['interface'])
+        run('/etc/init.d/firewall', 'reload')
         run('/etc/init.d/singbox-gui', 'enable')
         restart_attempted = True
         run('/etc/init.d/singbox-gui', 'restart')
         wait_service(s['device'])
-        # Reload netifd without restarting WAN, then bring up only our interface.
-        run('ubus', 'call', 'network', 'reload', '{}')
-        run('/sbin/ifup', s['interface'])
-        run('/etc/init.d/firewall', 'reload')
         reload_pbr()
     except Exception:
         if restart_attempted:
@@ -1351,11 +1351,11 @@ def apply():
             recovery = RUN / 'recovery.json'
             atomic(recovery, previous)
             try:
+                previous_iface = json.loads(old_owned)['interface'] if old_owned else s['interface']
+                run('/sbin/ifup', previous_iface, check=False)
                 run('/etc/init.d/singbox-gui', 'restart')
                 device = next(i['interface_name'] for i in previous['inbounds'] if i.get('type') == 'tun')
                 wait_service(device)
-                previous_iface = json.loads(old_owned)['interface'] if old_owned else s['interface']
-                run('/sbin/ifup', previous_iface, check=False)
             finally:
                 recovery.unlink(missing_ok=True)
         reload_pbr()

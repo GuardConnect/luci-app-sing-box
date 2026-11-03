@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1-r3 — 2026-11-03
+
+- Fix automatic routes disappearing after apply: complete netifd reload/ifup and firewall setup before core startup.
+- Routing apply and recovery no longer call ifup after the core installs its TUN addresses/routes.
+- Verified on a live OpenWrt LAN: repeated apply, 46 TUN routes, DHCP lease acquisition, direct WAN fallback and all seven configured routing rules. HTTP 403 from ChatGPT remains a site-access limitation.
+- 63 backend regression tests pass. This identifies an address/route flush bug, not proof of the cause of the earlier historical DHCP failure.
+
 ## 0.1.1-r2 — 2026-11-03
 
 - Routing apply now requires both a running service and its TUN device.

@@ -55,11 +55,11 @@ chmod 755 "$GUI/etc/init.d/singbox-gui" "$GUI/etc/hotplug.d/iface/95-singbox-gui
     "$GUI/usr/libexec/singbox-gui-core" "$GUI/usr/libexec/singbox-core-manager" "$GUI/usr/libexec/rpcd/luci.singbox.core"
 chmod 600 "$GUI/etc/config/singbox_gui"
 "$APK" mkpkg --compat 3.0.0 --files "$GUI" --info name:luci-app-sing-box \
-    --info version:0.1.1-r2 --info arch:noarch --info 'license:MIT AND CC-BY-4.0' \
+    --info version:0.1.1-r3 --info arch:noarch --info 'license:MIT AND CC-BY-4.0' \
     --info 'description:LuCI VLESS subscriptions, routing, DNS and latency tests' \
     --info 'depends:luci-base rpcd sing-box>=1.14.4 python3 curl ca-bundle kmod-tun resolveip' \
     --script post-install:"$SOURCE_DIR/tools/post-install.sh" \
     --script post-upgrade:"$SOURCE_DIR/tools/post-install.sh" \
     --script pre-deinstall:"$SOURCE_DIR/tools/pre-deinstall.sh" \
-    --output artifacts/luci-app-sing-box-0.1.1-r2.apk
+    --output artifacts/luci-app-sing-box-0.1.1-r3.apk
 sha256sum artifacts/*.apk
