@@ -25,6 +25,24 @@ S = dict(interface='sbvpn', device='sb-tun0', uplink='eth0', source_zone='lan',
 
 
 class BackendTests(unittest.TestCase):
+    def test_routing_worker_spawn_failure_allows_retry(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(b, 'RUN', Path(directory)), patch.object(b.subprocess, 'Popen', side_effect=[OSError('fork failed'), MagicMock()]):
+            args = dict(mode='check', text=json.dumps(b.routing.defaults()))
+            with self.assertRaises(OSError):
+                b.routing_job('routing_start', args)
+            self.assertEqual(list((b.RUN / 'routing-jobs').glob('*.json')), [])
+            self.assertTrue(b.routing_job('routing_start', args)['ok'])
+
+    def test_existing_tun_does_not_prove_service_is_running(self):
+        stopped = json.dumps({'singbox-gui': {'instances': {'main': {'running': False}}}})
+        running = json.dumps({'singbox-gui': {'instances': {'main': {'running': True}}}})
+        with patch.object(b, 'run', side_effect=[stopped, running]) as command, patch.object(Path, 'exists', return_value=True), patch.object(b.time, 'sleep'):
+            b.wait_service('test-tun')
+            self.assertEqual(command.call_count, 2)
+        with patch.object(b, 'run', return_value=stopped), patch.object(Path, 'exists', return_value=True), patch.object(b.time, 'sleep'):
+            with self.assertRaises(ValueError):
+                b.wait_service('test-tun')
+
     def setUp(self):
         # Never inherit the live router routing profile or subscription store.
         store = tempfile.TemporaryDirectory()
@@ -286,18 +304,22 @@ class BackendTests(unittest.TestCase):
             folder=b.RUN/'routing-jobs';folder.mkdir();ident='a'*32
             b.atomic(folder/(ident+'-request.json'),dict(mode='apply',profile=profile))
             b.atomic(b.STORE/'routing.json',b.routing.defaults());old=(b.STORE/'routing.json').read_bytes()
-            (b.RUN/'config.json').write_text('old-runtime')
+            previous = {'inbounds': [{'type': 'tun', 'interface_name': 'previous-tun'}]}
+            b.atomic(b.RUN/'config.json', previous)
             attempts=[]
             def command(*args,**kwargs):
                 if args[:3]==('ubus','call','service'):return json.dumps({'singbox-gui':{'instances':{'main':{'running':True}}}})
                 if args==('/etc/init.d/singbox-gui','restart'):
                     attempts.append(args)
                     if len(attempts)==1:raise ValueError('startup failed')
+                    self.assertEqual(json.loads((b.RUN/'recovery.json').read_text()), previous)
                 return ''
-            with patch.object(b,'settings',return_value=settings),patch.object(b,'load_nodes',return_value=[node]),patch.object(b,'run',side_effect=command),patch.object(b,'generate',return_value=settings),patch.object(b,'uci',return_value='interface'):
+            with patch.object(b,'settings',return_value=settings),patch.object(b,'load_nodes',return_value=[node]),patch.object(b,'run',side_effect=command),patch.object(b,'generate',return_value=settings),patch.object(b,'uci',return_value='interface'),patch.object(b,'wait_service') as wait:
                 b.routing_worker(ident)
             self.assertEqual((b.STORE/'routing.json').read_bytes(),old)
-            self.assertEqual((b.RUN/'config.json').read_text(),'old-runtime')
+            self.assertEqual(json.loads((b.RUN/'config.json').read_text()),previous)
+            wait.assert_called_once_with('previous-tun')
+            self.assertFalse((b.RUN/'recovery.json').exists())
             self.assertEqual(len(attempts),2)
             self.assertFalse(json.loads((folder/(ident+'.json')).read_text())['ok'])
 

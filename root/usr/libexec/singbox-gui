@@ -505,8 +505,14 @@ def routing_job(method, args):
         ident = uuid.uuid4().hex
         atomic(folder / (ident + '-request.json'), dict(profile=profile, mode=mode))
         atomic(folder / (ident + '.json'), dict(ok=True, state='running', message='Validating routing profile'))
-        subprocess.Popen([sys.executable, __file__, 'routing-worker', ident], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            subprocess.Popen([sys.executable, __file__, 'routing-worker', ident], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            # A worker that never started must not lock the UI for ten minutes.
+            (folder / (ident + '-request.json')).unlink(missing_ok=True)
+            (folder / (ident + '.json')).unlink(missing_ok=True)
+            raise
         return dict(ok=True, job=ident)
     ident = args.get('job', '')
     if not re.fullmatch('[a-f0-9]{32}', ident) or not (folder / (ident + '.json')).exists():
@@ -625,12 +631,7 @@ def routing_worker(ident):
                             atomic(response, dict(ok=True, state='running', message='Applying routing rules'))
                             restart_attempted = True
                             run('/etc/init.d/singbox-gui', 'restart')
-                            for _ in range(100):
-                                if Path('/sys/class/net/' + active['device']).exists():
-                                    break
-                                time.sleep(0.15)
-                            else:
-                                raise ValueError('TUN did not appear after applying routing')
+                            wait_service(active['device'])
                             # ifup also triggers the package hotplug hook to refresh PBR's TUN table.
                             run('/sbin/ifup', active['interface'])
                             applied = True
@@ -644,9 +645,20 @@ def routing_worker(ident):
                         else:
                             runtime.unlink(missing_ok=True)
                         if restart_attempted:
-                            run('/etc/init.d/singbox-gui', 'restart' if was_running else 'stop', check=False)
-                            if was_running:
-                                run('/sbin/ifup', settings()['interface'], check=False)
+                            run('/etc/init.d/singbox-gui', 'stop', check=False)
+                            if was_running and old_runtime is not None:
+                                # Start the exact last runtime, not a freshly
+                                # generated configuration using newer settings.
+                                previous = json.loads(old_runtime)
+                                recovery = RUN / 'recovery.json'
+                                atomic(recovery, previous)
+                                try:
+                                    run('/etc/init.d/singbox-gui', 'restart')
+                                    device = next(i['interface_name'] for i in previous['inbounds'] if i.get('type') == 'tun')
+                                    wait_service(device)
+                                    run('/sbin/ifup', settings()['interface'], check=False)
+                                finally:
+                                    recovery.unlink(missing_ok=True)
                         raise
         message = {'check':'Routing profile is valid', 'save':'Routing profile saved', 'apply':'Routing profile saved and applied'}[mode]
         if mode == 'apply' and not applied:

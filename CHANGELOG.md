@@ -1,6 +1,13 @@
 # Changelog
 
-## v0.1.1 — 2026-11-02
+## 0.1.1-r2 — 2026-11-03
+
+- Routing apply now requires both a running service and its TUN device.
+- Failed routing apply restores the exact previous runtime via the recovery path and verifies its startup.
+- Failed routing-worker creation no longer leaves a running job blocking retries.
+- Regression tests cover stale TUN, failed worker creation, and runtime recovery.
+
+## v0.1.1 вЂ” 2026-11-02
 
 - Fix native routing condition groups to match Throne and Sing-Box 1.14.4; preserve explicit OR and safe inversion scope.
 - Merge geosite, GeoIP and custom rule-set references without overwriting.
@@ -9,7 +16,7 @@
 - Include earlier automatic TUN/DNS compatibility fixes; no live router installation is performed by the tests.
 - Existing AND profiles with multiple fields in the same native group intentionally change to native semantics on re-apply; see docs/ROUTING-SEMANTICS.md.
 
-## v0.1.0 вЂ” 2026-11-02
+## v0.1.0 РІР‚вЂќ 2026-11-02
 
 Initial public release; APK version 0.1.0-r8.
 
