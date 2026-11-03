@@ -6,13 +6,14 @@
 
 [Download](https://github.com/GuardConnect/luci-app-sing-box/releases/latest) · [Report an issue](https://github.com/GuardConnect/luci-app-sing-box/issues)
 
-## New in 0.1.1
+## New in 0.1.1-r3
 
+- Fixed TUN addresses and automatic routes disappearing after applying settings.
 - Routing rules now follow Throne-style native Sing-Box 1.14.4 semantics.
 - Improved startup checks and restoration of the previous configuration after failed apply.
 - A failed validation-worker launch no longer blocks retries.
 
-Build **0.1.1-r2** passed 62 automated tests and 100 requests through core 1.14.4. [Routing details (Russian)](docs/ROUTING-SEMANTICS.md).
+Build **0.1.1-r3** passed 63 automated tests. Live router checks covered repeated apply, TUN, automatic routes, DHCP, direct WAN fallback and seven routing rules. The rule generator was also tested with 100 requests through core 1.14.4. [Routing details (Russian)](docs/ROUTING-SEMANTICS.md).
 
 ## Features
 
@@ -30,12 +31,12 @@ Build **0.1.1-r2** passed 62 automated tests and 100 requests through core 1.14.
 Tested on **OpenWrt 25.12.6 x86/64** with **Sing-Box 1.14.4**. Install **Sing-Box core 1.14.4** separately for this build. Newer core versions have not been separately verified. Other architectures have not been tested on real devices yet.
 
 1. Back up your router settings.
-2. Download `luci-app-sing-box-0.1.1-r2.apk` from [Releases](https://github.com/GuardConnect/luci-app-sing-box/releases/latest) and copy it to `/tmp` on the router.
+2. Download `luci-app-sing-box-0.1.1-r3.apk` from [Releases](https://github.com/GuardConnect/luci-app-sing-box/releases/latest) and copy it to `/tmp` on the router.
 3. Connect to the router over SSH and run:
 
 ```sh
 apk update
-apk add --allow-untrusted /tmp/luci-app-sing-box-0.1.1-r2.apk
+apk add --allow-untrusted /tmp/luci-app-sing-box-0.1.1-r3.apk
 ```
 
 `--allow-untrusted` is required because the package is currently unsigned. If installation reports a missing compatible Sing-Box dependency, install the core first.
@@ -54,7 +55,7 @@ Open **Services → Sing-Box** in OpenWrt.
 
 Use **Ping** to check your servers. If the connection fails, open **Log**.
 
-Automatic capture still needs caution: a previous DHCP failure was reported and its cause remains unresolved. This build does not establish that the DHCP issue is fixed.
+Automatic capture was tested on OpenWrt 25.12.6 x86/64: DHCP leases work and routes survive apply. A full router reboot and other devices were not tested. Matching a rule does not guarantee website access: ChatGPT may still return HTTP 403 from the service.
 
 ## Screenshots
 
