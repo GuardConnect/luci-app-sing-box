@@ -6,15 +6,6 @@
 
 [Download](https://github.com/GuardConnect/luci-app-sing-box/releases/latest) · [Report an issue](https://github.com/GuardConnect/luci-app-sing-box/issues)
 
-## New in 0.1.1-r3
-
-- Fixed TUN addresses and automatic routes disappearing after applying settings.
-- Routing rules now follow Throne-style native Sing-Box 1.14.4 semantics.
-- Improved startup checks and restoration of the previous configuration after failed apply.
-- A failed validation-worker launch no longer blocks retries.
-
-Build **0.1.1-r3** passed 63 automated tests. Live router checks covered repeated apply, TUN, automatic routes, DHCP, direct WAN fallback and seven routing rules. The rule generator was also tested with 100 requests through core 1.14.4. [Routing details (Russian)](docs/ROUTING-SEMANTICS.md).
-
 ## Features
 
 - Multiple subscriptions with automatic updates.
